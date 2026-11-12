@@ -96,6 +96,14 @@ SAMPLERS = {
     "TCD": 9,
     "EulerATrailing": 10,
     "DPMPPSDETrailing": 11,
+    "DPMPP2MAYS": 12,
+    "EulerAAYS": 13,
+    "DPMPPSDEAYS": 14,
+    "DPMPP2MTrailing": 15,
+    "DDIMTrailing": 16,
+    "UniPCTrailing": 17,
+    "UniPCAYS": 18,
+    "TCDTrailing": 19,
 }
 SEED_MODES = {"Legacy": 0, "TorchCpuCompatible": 1, "ScaleAlike": 2, "NvidiaGpuCompatible": 3}
 LORA_MODES = {"all": 0, "base": 1, "refiner": 2}

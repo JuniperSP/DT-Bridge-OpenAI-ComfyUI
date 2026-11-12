@@ -19,9 +19,11 @@ OpenAI REST (JSON)  ->  gRPC ImageGenerationService/GenerateImage
 
 ## Run
 
-Fresh Mac? Start here (idempotent, safe to re-run):
+Fresh Mac? Clone and run setup (idempotent, safe to re-run):
 
 ```sh
+git clone https://github.com/JuniperSP/DT-Bridge-OpenAI-ComfyUI.git
+cd DT-Bridge-OpenAI-ComfyUI
 ./dt setup          # uv/venv/deps, gen/ bindings, gRPC binary, permissions
 ./dt doctor         # verify everything, exits non-zero on problems
 ```

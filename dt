@@ -46,6 +46,7 @@ BRIDGE_HOST="${DT_BRIDGE_HOST:-${BRIDGE_HOST:-0.0.0.0}}"
 UI_PORT="${DT_UI_PORT:-${UI_PORT:-9700}}"
 GRPC_BIN="${DT_GRPC_BIN:-$(command -v gRPCServerCLI-macOS || true)}"
 [ -z "$GRPC_BIN" ] && GRPC_BIN="$HOME/.local/bin/gRPCServerCLI-macOS"
+[ ! -x "$GRPC_BIN" ] && [ -x "$ROOT/gRPCServerCLI-macOS" ] && GRPC_BIN="$ROOT/gRPCServerCLI-macOS"
 export BRIDGE_HOST BRIDGE_PORT
 
 VENV_PY="$ROOT/.venv/bin/python"
