@@ -164,6 +164,7 @@ fi
 # ------------------------------------------------------------------- settings
 step "bridge settings"
 
+mkdir -p "$ROOT/models"
 if [ -f "$ROOT/bridge.env" ]; then
   ok "bridge.env present"
 else
@@ -172,6 +173,7 @@ else
 BRIDGE_HOST=127.0.0.1
 BRIDGE_PORT=9955
 BRIDGE_API_KEY=
+DT_EXTRA_MODELS_DIR=
 ENV
   ok "created bridge.env (loopback only - open ./dt tui, press n to expose)"
 fi

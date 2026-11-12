@@ -6,18 +6,19 @@
 #   ./dt restart
 #   ./dt restart-bridge restart the HTTP bridge only (keeps the model loaded)
 #   ./dt status
-#   ./dt tui            full-screen terminal UI (start/stop/logs/presets/network)
+#   ./dt tui            full-screen terminal UI (start/stop/logs/presets/network/models)
 #   ./dt ui             start everything and open the web control panel
+#   ./dt models [open|local|sync|dir <path>]  open DT Models folder or auto-link custom models
 #   ./dt shutdown       stop everything, including the control panel
 #   ./dt setup          first-time setup for a fresh Mac (re-runnable)
 #   ./dt logs [grpc|bridge|ui] [-f]
 #   ./dt doctor         check models, ports, deps
 #   ./dt url            print LAN + tailnet endpoints
 #
-# Network settings (BRIDGE_HOST/PORT/API_KEY) persist in bridge.env, which this
-# script sources on every run. The TUI writes it for you (press n).
+# Network & model folder settings persist in bridge.env, which this script
+# sources on every run. The TUI writes it for you (press n or m).
 #
-# Env overrides: DT_MODELS_DIR, DT_GRPC_PORT, DT_BRIDGE_PORT, DT_UI_PORT, DT_GRPC_BIN
+# Env overrides: DT_MODELS_DIR, DT_EXTRA_MODELS_DIR, DT_GRPC_PORT, DT_BRIDGE_PORT, DT_UI_PORT, DT_GRPC_BIN
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +41,11 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 MODELS_DIR="${DT_MODELS_DIR:-$HOME/Library/Containers/com.liuliu.draw-things/Data/Documents/Models}"
+DOCS_DIR="$(dirname "$MODELS_DIR")"
+LOCAL_MODELS_DIR="$ROOT/models"
+EXTRA_MODELS_DIR="${DT_EXTRA_MODELS_DIR:-}"
+# Expand leading ~ in EXTRA_MODELS_DIR if present
+EXTRA_MODELS_DIR="${EXTRA_MODELS_DIR/#\~/$HOME}"
 GRPC_PORT="${DT_GRPC_PORT:-${GRPC_PORT:-7859}}"
 BRIDGE_PORT="${DT_BRIDGE_PORT:-${BRIDGE_PORT:-9955}}"
 BRIDGE_HOST="${DT_BRIDGE_HOST:-${BRIDGE_HOST:-0.0.0.0}}"
@@ -57,7 +63,93 @@ ok() { printf '%s✔%s %s\n' "$c_green" "$c_reset" "$*"; }
 warn() { printf '%s!%s %s\n' "$c_yellow" "$c_reset" "$*"; }
 err() { printf '%s✘%s %s\n' "$c_red" "$c_reset" "$*" >&2; }
 
-mkdir -p "$STATE"
+mkdir -p "$STATE" "$LOCAL_MODELS_DIR"
+
+sync_models() {
+  local quiet="${1:-0}" linked=0 pruned=0 src base dir
+  [ -d "$MODELS_DIR" ] || return 0
+
+  # Prune broken symlinks in MODELS_DIR so removed external files don't linger
+  for src in "$MODELS_DIR"/*; do
+    [ -L "$src" ] || continue
+    if [ ! -e "$src" ]; then
+      rm -f "$src" 2>/dev/null && pruned=$((pruned + 1))
+    fi
+  done
+
+  # Symlink models from ./models, Draw Things Documents root, and DT_EXTRA_MODELS_DIR
+  for dir in "$LOCAL_MODELS_DIR" "$DOCS_DIR" "$EXTRA_MODELS_DIR"; do
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    [ "$dir" = "$MODELS_DIR" ] && continue
+    for src in "$dir"/*.ckpt "$dir"/*.ckpt-tensordata "$dir"/*.safetensors "$dir"/custom*.json; do
+      [ -e "$src" ] || continue
+      base="$(basename "$src")"
+      [ -e "$MODELS_DIR/$base" ] || [ -L "$MODELS_DIR/$base" ] && continue
+      if ln -s "$src" "$MODELS_DIR/$base" 2>/dev/null; then
+        linked=$((linked + 1))
+      fi
+    done
+  done
+
+  if [ "$quiet" != "1" ]; then
+    ok "models synced (linked $linked new, cleaned $pruned broken link(s))"
+    info "  DT Models dir : $MODELS_DIR"
+    info "  Project drop  : $LOCAL_MODELS_DIR"
+    [ -n "$EXTRA_MODELS_DIR" ] && info "  Extra folder  : $EXTRA_MODELS_DIR"
+  elif [ "$linked" -gt 0 ]; then
+    ok "auto-linked $linked custom model file(s) into Draw Things Models"
+  fi
+  return 0
+}
+
+cmd_models() {
+  local sub="${1:-open}"
+  case "$sub" in
+    open)
+      sync_models 1
+      if [ -d "$MODELS_DIR" ]; then
+        ok "opening Draw Things Models folder in Finder: $MODELS_DIR"
+        open "$MODELS_DIR"
+      else
+        err "Draw Things Models folder not found: $MODELS_DIR"
+        return 1
+      fi
+      ;;
+    local)
+      mkdir -p "$LOCAL_MODELS_DIR"
+      ok "opening project models drop-folder in Finder: $LOCAL_MODELS_DIR"
+      open "$LOCAL_MODELS_DIR"
+      ;;
+    sync)
+      sync_models 0
+      ;;
+    dir)
+      local new_dir="${2:-}"
+      if [ -z "$new_dir" ]; then
+        err "usage: ./dt models dir <folder-path>"
+        return 1
+      fi
+      new_dir="${new_dir/#\~/$HOME}"
+      if [ ! -d "$new_dir" ]; then
+        err "directory not found: $new_dir"
+        return 1
+      fi
+      touch "$ENV_FILE"
+      if grep -q '^DT_EXTRA_MODELS_DIR=' "$ENV_FILE" 2>/dev/null; then
+        sed -i '' "s|^DT_EXTRA_MODELS_DIR=.*|DT_EXTRA_MODELS_DIR=$new_dir|" "$ENV_FILE"
+      else
+        printf 'DT_EXTRA_MODELS_DIR=%s\n' "$new_dir" >>"$ENV_FILE"
+      fi
+      EXTRA_MODELS_DIR="$new_dir"
+      ok "saved DT_EXTRA_MODELS_DIR=$new_dir in bridge.env"
+      sync_models 0
+      ;;
+    *)
+      err "unknown models subcommand: $sub (use: open, local, sync, dir <path>)"
+      return 1
+      ;;
+  esac
+}
 
 rotate_log() {
   local file="$1" limit="${2:-5242880}" size
@@ -129,6 +221,8 @@ start_grpc() {
     err "models directory not found: $MODELS_DIR"
     return 1
   fi
+
+  sync_models 1
 
   info "${c_dim}starting gRPC server on 127.0.0.1:$GRPC_PORT${c_reset}"
   rotate_log "$GRPC_LOG"
@@ -454,6 +548,7 @@ case "${1:-}" in
   ui) cmd_ui ;;
   setup) shift; cmd_setup "$@" ;;
   tui) cmd_tui ;;
+  models) shift; cmd_models "$@" ;;
   shutdown) cmd_shutdown ;;
   status) cmd_status ;;
   logs) shift; cmd_logs "${1:-bridge}" "${2:-}" ;;

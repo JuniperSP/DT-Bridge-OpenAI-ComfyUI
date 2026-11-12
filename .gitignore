@@ -225,9 +225,10 @@ __marimo__/
 output/
 *.log
 
-# local settings (bind address, API key, personal preset)
+# local settings (bind address, API key, personal preset, local models drop-folder)
 bridge.env
 config.json
+models/
 
 # downloaded build tools (./setup.sh --tools fetches them)
 tools/

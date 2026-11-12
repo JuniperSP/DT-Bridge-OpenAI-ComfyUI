@@ -45,6 +45,7 @@ Then one command opens a full-screen terminal UI (stdlib `curses`, no browser):
 | `x` | stop both |
 | `r` | restart |
 | `l` | **load a preset from Draw Things** (↑↓ select, Enter apply) |
+| `m` | **models panel** (open DT `Models` folder in Finder, auto-link custom models) |
 | `n` | **network panel** (bind mode, API key, Tailscale HTTPS) |
 | `g` / `b` | show `grpc.log` / `bridge.log` |
 | `p` | test-generate (prompt is prefilled from the loaded preset) |
@@ -112,6 +113,24 @@ Inspect the presets without the UI:
 .venv/bin/python dtconfig.py --json --limit 5  # raw entries
 ```
 
+### Custom models & external folders
+
+Draw Things keeps its `Models` folder deep inside its macOS container
+(`~/Library/Containers/com.liuliu.draw-things/Data/Documents/Models`), which
+Finder hides by default. Instead of hunting for that folder by hand, press `m`
+in `./dt tui` (or use `./dt models`):
+
+- **Open in Finder (`o` in the Models panel, or `./dt models open`)** — opens
+  Draw Things' internal `Models` folder directly in Finder.
+- **Drop into `./models` (`p` in the Models panel, or `./dt models local`)** —
+  drop `.ckpt` / `.safetensors` files into the local `./models` folder inside
+  this project; `./dt start` (or `s` in the Models panel) automatically
+  symlinks (`ln -s`, 0 bytes extra disk space) them into Draw Things' `Models`
+  folder.
+- **Link an external folder (`f` in the Models panel, or `./dt models dir <path>`)** —
+  point `DT_EXTRA_MODELS_DIR` at `~/Downloads` or an external SSD and every
+  model file in that folder is auto-linked into Draw Things' `Models` folder.
+
 Prefer commands? Same thing without the UI:
 
 ```sh
@@ -121,6 +140,10 @@ Prefer commands? Same thing without the UI:
 ./dt stop       # stop gRPC + bridge
 ./dt restart
 ./dt restart-bridge  # restart only the HTTP bridge
+./dt models          # open Draw Things' hidden Models folder in Finder
+./dt models local    # open ./models drop-folder in Finder
+./dt models sync     # symlink custom models into Draw Things Models
+./dt models dir ~/Downloads  # auto-link models from a custom folder
 ./dt logs grpc  # or: ./dt logs bridge -f
 ./dt doctor     # venv/deps/bindings/models/tailscale, exits non-zero on issues
 ./dt url        # prints LAN / tailnet / https endpoints

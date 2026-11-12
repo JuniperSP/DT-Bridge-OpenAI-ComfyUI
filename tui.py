@@ -31,6 +31,13 @@ DT = str(ROOT / "dt")
 
 GRPC_PORT = int(os.environ.get("DT_GRPC_PORT", "7859"))
 BRIDGE_PORT = int(os.environ.get("DT_BRIDGE_PORT", "9955"))
+DT_MODELS_DIR = Path(
+    os.environ.get(
+        "DT_MODELS_DIR",
+        str(Path.home() / "Library/Containers/com.liuliu.draw-things/Data/Documents/Models"),
+    )
+)
+LOCAL_MODELS_DIR = ROOT / "models"
 
 S: dict[str, Any] = {
     "busy": False,
@@ -47,6 +54,7 @@ S: dict[str, Any] = {
     "picker": None,
     "preset_prompt": "",
     "net": {"open": False, "mode": 1, "key": "", "https": False},
+    "models": {"open": False, "extra_dir": ""},
 }
 
 
@@ -140,6 +148,7 @@ def load_bridge_env() -> None:
     except OSError:
         return
     S["net"]["key"] = values.get("BRIDGE_API_KEY", "")
+    S["models"]["extra_dir"] = values.get("DT_EXTRA_MODELS_DIR", "")
     host = values.get("BRIDGE_HOST", "0.0.0.0")
     for i, (_, candidate) in enumerate(net_modes()):
         if candidate == host:
@@ -148,24 +157,32 @@ def load_bridge_env() -> None:
     S["net"]["https"] = bool(netutil.serve_state(BRIDGE_PORT).get("enabled"))
 
 
+def write_bridge_env(host: str | None = None) -> bool:
+    if host is None:
+        host = net_host()
+    lines = [
+        "# written by the dt TUI - safe to edit by hand",
+        f"BRIDGE_HOST={host}",
+        f"BRIDGE_PORT={BRIDGE_PORT}",
+        f"BRIDGE_API_KEY={S['net']['key']}",
+        f"DT_EXTRA_MODELS_DIR={S['models']['extra_dir']}",
+    ]
+    try:
+        (ROOT / "bridge.env").write_text("\n".join(lines) + "\n")
+        return True
+    except OSError as exc:
+        S["message"] = f"cannot write bridge.env: {exc}"
+        return False
+
+
 def apply_network() -> None:
     host = net_host()
-    key = S["net"]["key"]
     https = bool(S["net"]["https"])
     if https and host not in ("127.0.0.1", "0.0.0.0"):
         # `tailscale serve` proxies to 127.0.0.1, so a tailnet-only bind would
         # make the HTTPS endpoint unreachable.
         host = "0.0.0.0"
-    lines = [
-        "# written by the dt TUI - safe to edit by hand",
-        f"BRIDGE_HOST={host}",
-        f"BRIDGE_PORT={BRIDGE_PORT}",
-        f"BRIDGE_API_KEY={key}",
-    ]
-    try:
-        (ROOT / "bridge.env").write_text("\n".join(lines) + "\n")
-    except OSError as exc:
-        S["message"] = f"cannot write bridge.env: {exc}"
+    if not write_bridge_env(host):
         return
 
     S["net"]["open"] = False
@@ -186,6 +203,29 @@ def apply_network() -> None:
         _base_cache.update(base=None, at=0.0)
         S["busy"] = False
         S["dirty"] = True
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def run_models_sync() -> None:
+    if S["busy"]:
+        return
+    S["busy"] = True
+    S["message"] = "syncing custom models into Draw Things…"
+    S["dirty"] = True
+
+    def work() -> None:
+        try:
+            proc = subprocess.run(
+                [DT, "models", "sync"], capture_output=True, text=True, timeout=60, cwd=str(ROOT), check=False
+            )
+            lines = [line.strip() for line in (proc.stdout or proc.stderr).splitlines() if line.strip()]
+            S["message"] = lines[0] if lines else "models synced"
+        except (OSError, subprocess.SubprocessError) as exc:
+            S["message"] = f"models sync failed: {exc}"
+        finally:
+            S["busy"] = False
+            S["dirty"] = True
 
     threading.Thread(target=work, daemon=True).start()
 
@@ -462,6 +502,49 @@ def draw_net(scr: Any) -> None:
     put(scr, top + 12, left + 3, "[a] apply & restart bridge      [Esc] close", curses.color_pair(5))
 
 
+def draw_models(scr: Any) -> None:
+    extra = S["models"]["extra_dir"]
+    try:
+        dt_files = list(DT_MODELS_DIR.glob("*.ckpt")) if DT_MODELS_DIR.is_dir() else []
+        symlinks = sum(1 for p in dt_files if p.is_symlink())
+        dt_summary = f"{len(dt_files)} .ckpt files ({symlinks} linked)"
+    except OSError:
+        dt_summary = "unreadable (check Full Disk Access)"
+
+    LOCAL_MODELS_DIR.mkdir(exist_ok=True)
+    try:
+        local_count = len(list(LOCAL_MODELS_DIR.glob("*.ckpt")) + list(LOCAL_MODELS_DIR.glob("*.safetensors")))
+    except OSError:
+        local_count = 0
+
+    height, width = scr.getmaxyx()
+    box_w = max(56, min(width - 4, 96))
+    box_h = 15
+    top = max(1, (height - box_h) // 2)
+    left = max(1, (width - box_w) // 2)
+
+    for i in range(box_h):
+        put(scr, top + i, left, "│" + " " * (box_w - 2) + "│")
+    put(scr, top, left, "┌" + "─" * (box_w - 2) + "┐")
+    put(scr, top + box_h - 1, left, "└" + "─" * (box_w - 2) + "┘")
+    put(scr, top, left + 2, " Models & Custom Folder ", curses.A_BOLD | curses.color_pair(4))
+
+    def line(offset: int, label: str, value: str, attr: int = 0) -> None:
+        put(scr, top + 1 + offset, left + 3, label)
+        put(scr, top + 1 + offset, left + 20, value[: box_w - 23], attr)
+
+    line(0, "DT Models dir", str(DT_MODELS_DIR), curses.color_pair(4))
+    line(1, "Status", dt_summary, curses.color_pair(1))
+    line(3, "Project drop", f"{LOCAL_MODELS_DIR}  ({local_count} file(s))")
+    line(4, "Extra folder", (extra or "(not set)") + "   [f] set  [d] clear",
+         curses.color_pair(1) if extra else curses.color_pair(3))
+    line(6, "How it works", "Drop .ckpt / .safetensors into ./models or Extra folder.")
+    line(7, "", "They are symlinked into Draw Things Models automatically.")
+
+    put(scr, top + 10, left + 3, "[o] open DT Models in Finder    [p] open ./models in Finder", curses.A_BOLD)
+    put(scr, top + 11, left + 3, "[s] sync / auto-link now        [f] set extra folder   [Esc] close", curses.color_pair(5))
+
+
 # ------------------------------------------------------------------------------ draw
 
 
@@ -545,7 +628,7 @@ def draw(scr: Any) -> None:
     row += 2
 
     bind_host = net_host()
-    keys = "[s] start  [x] stop  [r] restart  [l] preset  [n] network  [g]/[b] logs  [p] generate  [o] output  [q] quit"
+    keys = "[s] start  [x] stop  [r] restart  [l] preset  [m] models  [n] network  [g]/[b] logs  [p] gen  [o] out  [q] quit"
     put(scr, row, 2, keys, curses.A_BOLD)
     row += 1
     put(scr, row, 2, f"bind {bind_host}:{BRIDGE_PORT}", curses.color_pair(5))
@@ -570,8 +653,12 @@ def draw(scr: Any) -> None:
     if S["net"]["open"]:
         draw_net(scr)
 
+    if S["models"]["open"]:
+        draw_models(scr)
+
     if S["input_target"]:
-        prefix = "api key> " if S["input_target"] == "apikey" else "prompt> "
+        prefixes = {"apikey": "api key> ", "models_dir": "extra models folder> "}
+        prefix = prefixes.get(S["input_target"], "prompt> ")
         put(scr, height - 3, 2, " " * max(0, width - 4))
         put(scr, height - 3, 2, prefix + S["buffer"], curses.A_REVERSE)
 
@@ -624,6 +711,14 @@ def main(scr: Any) -> None:
                 if target == "apikey":
                     S["net"]["key"] = buffer.strip()
                     S["message"] = "api key set (press a to apply)"
+                elif target == "models_dir":
+                    expanded = str(Path(buffer.strip()).expanduser()) if buffer.strip() else ""
+                    if expanded and not Path(expanded).is_dir():
+                        S["message"] = f"folder not found: {expanded}"
+                    else:
+                        S["models"]["extra_dir"] = expanded
+                        write_bridge_env()
+                        run_models_sync()
                 else:
                     run_generate(buffer)
             elif key == 27:
@@ -687,6 +782,27 @@ def main(scr: Any) -> None:
                 S["net"]["open"] = False
             continue
 
+        if S["models"]["open"]:
+            if key == ord("o"):
+                subprocess.Popen(["open", str(DT_MODELS_DIR)])
+                S["message"] = "opened Draw Things Models folder in Finder"
+            elif key == ord("p"):
+                LOCAL_MODELS_DIR.mkdir(exist_ok=True)
+                subprocess.Popen(["open", str(LOCAL_MODELS_DIR)])
+                S["message"] = "opened ./models drop-folder in Finder"
+            elif key == ord("f"):
+                S["input_target"] = "models_dir"
+                S["buffer"] = S["models"]["extra_dir"]
+            elif key == ord("d"):
+                S["models"]["extra_dir"] = ""
+                write_bridge_env()
+                S["message"] = "extra models folder cleared"
+            elif key == ord("s"):
+                run_models_sync()
+            elif key == 27:
+                S["models"]["open"] = False
+            continue
+
         if key in (ord("q"),):
             return
         if key == ord("s"):
@@ -704,6 +820,8 @@ def main(scr: Any) -> None:
             S["buffer"] = S["preset_prompt"]
         elif key == ord("l"):
             open_picker()
+        elif key == ord("m"):
+            S["models"]["open"] = True
         elif key == ord("n"):
             S["net"]["open"] = True
         elif key == ord("o"):
