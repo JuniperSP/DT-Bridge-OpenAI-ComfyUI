@@ -1,0 +1,10 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+  "extraPaths": ["gen"],
+  "include": ["*.py"],
+  "exclude": [".venv", "gen", "tools", "output", ".run"],
+  "reportMissingImports": "warning"
+}

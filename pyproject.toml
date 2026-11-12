@@ -1,0 +1,28 @@
+[project]
+name = "dt-bridge-oai"
+version = "1.0.0"
+description = "OpenAI-compatible image generation bridge for the Draw Things gRPC server"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "grpclib",
+  "flatbuffers",
+  "protobuf",
+  "numpy",
+  "pillow",
+  "websockets",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+# The generated bindings in gen/ are imported after a sys.path tweak.
+[tool.ruff.lint.per-file-ignores]
+"bridge.py" = ["E402"]
+"dtconfig.py" = ["E402"]
+"gen/*" = ["ALL"]

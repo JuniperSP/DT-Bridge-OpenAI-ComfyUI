@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+# dt - start/stop the Draw Things gRPC server + the OpenAI/ComfyUI bridge.
+#
+#   ./dt start          start gRPC + bridge
+#   ./dt stop           stop gRPC + bridge (control panel stays up)
+#   ./dt restart
+#   ./dt restart-bridge restart the HTTP bridge only (keeps the model loaded)
+#   ./dt status
+#   ./dt tui            full-screen terminal UI (start/stop/logs/presets/network)
+#   ./dt ui             start everything and open the web control panel
+#   ./dt shutdown       stop everything, including the control panel
+#   ./dt setup          first-time setup for a fresh Mac (re-runnable)
+#   ./dt logs [grpc|bridge|ui] [-f]
+#   ./dt doctor         check models, ports, deps
+#   ./dt url            print LAN + tailnet endpoints
+#
+# Network settings (BRIDGE_HOST/PORT/API_KEY) persist in bridge.env, which this
+# script sources on every run. The TUI writes it for you (press n).
+#
+# Env overrides: DT_MODELS_DIR, DT_GRPC_PORT, DT_BRIDGE_PORT, DT_UI_PORT, DT_GRPC_BIN
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT" || exit 1
+STATE="$ROOT/.run"
+GRPC_LOG="$STATE/grpc.log"
+BRIDGE_LOG="$STATE/bridge.log"
+UI_LOG="$STATE/ui.log"
+GRPC_PID="$STATE/grpc.pid"
+BRIDGE_PID="$STATE/bridge.pid"
+UI_PID="$STATE/ui.pid"
+
+# Persisted network config (written by the TUI, safe to edit by hand).
+ENV_FILE="$ROOT/bridge.env"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
+MODELS_DIR="${DT_MODELS_DIR:-$HOME/Library/Containers/com.liuliu.draw-things/Data/Documents/Models}"
+GRPC_PORT="${DT_GRPC_PORT:-${GRPC_PORT:-7859}}"
+BRIDGE_PORT="${DT_BRIDGE_PORT:-${BRIDGE_PORT:-9955}}"
+BRIDGE_HOST="${DT_BRIDGE_HOST:-${BRIDGE_HOST:-0.0.0.0}}"
+UI_PORT="${DT_UI_PORT:-${UI_PORT:-9700}}"
+GRPC_BIN="${DT_GRPC_BIN:-$(command -v gRPCServerCLI-macOS || true)}"
+[ -z "$GRPC_BIN" ] && GRPC_BIN="$HOME/.local/bin/gRPCServerCLI-macOS"
+export BRIDGE_HOST BRIDGE_PORT
+
+VENV_PY="$ROOT/.venv/bin/python"
+
+c_reset=$'\033[0m'; c_dim=$'\033[2m'; c_red=$'\033[31m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_cyan=$'\033[36m'
+info() { printf '%s\n' "$*"; }
+ok() { printf '%s✔%s %s\n' "$c_green" "$c_reset" "$*"; }
+warn() { printf '%s!%s %s\n' "$c_yellow" "$c_reset" "$*"; }
+err() { printf '%s✘%s %s\n' "$c_red" "$c_reset" "$*" >&2; }
+
+mkdir -p "$STATE"
+
+rotate_log() {
+  local file="$1" limit="${2:-5242880}" size
+  [ -f "$file" ] || return 0
+  size=$(wc -c <"$file" 2>/dev/null || echo 0)
+  if [ "$size" -gt "$limit" ]; then
+    mv -f "$file" "$file.1"
+  fi
+}
+
+pid_alive() {
+  local pid_file="$1" pid
+  [ -f "$pid_file" ] || return 1
+  pid="$(cat "$pid_file" 2>/dev/null)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+port_open() {
+  nc -z 127.0.0.1 "$1" >/dev/null 2>&1
+}
+
+wait_for_port() {
+  local port="$1" tries="${2:-60}" i=0
+  while [ "$i" -lt "$tries" ]; do
+    port_open "$port" && return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+  return 1
+}
+
+lan_ip() {
+  ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1
+}
+
+tailnet_ip() {
+  "$VENV_PY" -c "import netutil;print(netutil.tailscale_ip() or '')" 2>/dev/null || true
+}
+
+ensure_venv() {
+  [ -x "$VENV_PY" ] && return 0
+  warn "no .venv yet - installing dependencies (one time)"
+  if command -v uv >/dev/null 2>&1; then
+    uv venv -p 3.13 "$ROOT/.venv" >/dev/null 2>&1 || uv venv "$ROOT/.venv"
+    uv pip install --python "$VENV_PY" -r "$ROOT/requirements.txt"
+  else
+    python3 -m venv "$ROOT/.venv"
+    "$VENV_PY" -m pip install --quiet --upgrade pip
+    "$VENV_PY" -m pip install --quiet -r "$ROOT/requirements.txt"
+  fi
+  ok "dependencies installed"
+}
+
+start_grpc() {
+  if pid_alive "$GRPC_PID"; then
+    ok "gRPC server already running (pid $(cat "$GRPC_PID"))"
+    return 0
+  fi
+  if port_open "$GRPC_PORT"; then
+    warn "port $GRPC_PORT is already in use (gRPC server not started by dt) - reusing it"
+    return 0
+  fi
+  if [ ! -x "$GRPC_BIN" ]; then
+    err "gRPCServerCLI-macOS not found (looked at $GRPC_BIN). Set DT_GRPC_BIN."
+    return 1
+  fi
+  if [ ! -d "$MODELS_DIR" ]; then
+    err "models directory not found: $MODELS_DIR"
+    return 1
+  fi
+
+  info "${c_dim}starting gRPC server on 127.0.0.1:$GRPC_PORT${c_reset}"
+  rotate_log "$GRPC_LOG"
+  nohup "$GRPC_BIN" "$MODELS_DIR" \
+    --address 127.0.0.1 --port "$GRPC_PORT" \
+    --no-tls --no-response-compression \
+    >>"$GRPC_LOG" 2>&1 &
+  echo $! >"$GRPC_PID"
+
+  if wait_for_port "$GRPC_PORT" 120; then
+    ok "gRPC server up (pid $(cat "$GRPC_PID"))"
+    return 0
+  fi
+  err "gRPC server did not open port $GRPC_PORT - see $GRPC_LOG"
+  return 1
+}
+
+start_bridge() {
+  if pid_alive "$BRIDGE_PID"; then
+    ok "bridge already running (pid $(cat "$BRIDGE_PID"))"
+    return 0
+  fi
+  if port_open "$BRIDGE_PORT"; then
+    warn "port $BRIDGE_PORT is already in use (bridge not started by dt)"
+    return 0
+  fi
+
+  ensure_venv || return 1
+  info "${c_dim}starting bridge on 0.0.0.0:$BRIDGE_PORT${c_reset}"
+  rotate_log "$BRIDGE_LOG"
+  nohup "$VENV_PY" bridge.py >>"$BRIDGE_LOG" 2>&1 &
+  echo $! >"$BRIDGE_PID"
+
+  local i=0
+  while [ "$i" -lt 60 ]; do
+    if curl -fsS -m 2 "http://127.0.0.1:$BRIDGE_PORT/healthz" >/dev/null 2>&1; then
+      ok "bridge up (pid $(cat "$BRIDGE_PID"))"
+      return 0
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  err "bridge did not answer /healthz - see $BRIDGE_LOG"
+  return 1
+}
+
+stop_one() {
+  local label="$1" pid_file="$2"
+  if ! pid_alive "$pid_file"; then
+    rm -f "$pid_file"
+    info "${c_dim}$label not running${c_reset}"
+    return 0
+  fi
+  local pid
+  pid="$(cat "$pid_file")"
+  kill "$pid" 2>/dev/null
+  local i=0
+  while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.25
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null
+  fi
+  rm -f "$pid_file"
+  ok "$label stopped (pid $pid)"
+}
+
+cmd_start() {
+  start_grpc || return 1
+  start_bridge || return 1
+  echo
+  cmd_url
+}
+
+start_ui() {
+  if pid_alive "$UI_PID"; then
+    ok "control panel already running (pid $(cat "$UI_PID"))"
+    open "http://127.0.0.1:$UI_PORT"
+    return 0
+  fi
+  if port_open "$UI_PORT"; then
+    warn "port $UI_PORT already in use (control panel not started by dt)"
+    open "http://127.0.0.1:$UI_PORT"
+    return 0
+  fi
+  ensure_venv || return 1
+  rotate_log "$UI_LOG"
+  nohup "$VENV_PY" ui.py >>"$UI_LOG" 2>&1 &
+  echo $! >"$UI_PID"
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    port_open "$UI_PORT" && break
+    sleep 0.5
+    i=$((i + 1))
+  done
+  if ! port_open "$UI_PORT"; then
+    err "control panel did not start - see $UI_LOG"
+    return 1
+  fi
+  ok "control panel up (pid $(cat "$UI_PID")) → http://127.0.0.1:$UI_PORT"
+  open "http://127.0.0.1:$UI_PORT"
+}
+
+cmd_ui() {
+  cmd_start >/dev/null || true
+  cmd_status
+  echo
+  start_ui
+}
+
+cmd_setup() {
+  exec "$ROOT/setup.sh" "$@"
+}
+
+cmd_tui() {
+  ensure_venv || return 1
+  exec "$VENV_PY" "$ROOT/tui.py"
+}
+
+cmd_shutdown() {
+  stop_one "bridge" "$BRIDGE_PID"
+  stop_one "gRPC server" "$GRPC_PID"
+  stop_one "control panel" "$UI_PID"
+}
+
+cmd_stop() {
+  stop_one "bridge" "$BRIDGE_PID"
+  stop_one "gRPC server" "$GRPC_PID"
+}
+
+cmd_restart_bridge() {
+  stop_one "bridge" "$BRIDGE_PID"
+  start_bridge
+}
+
+cmd_restart() {
+  cmd_stop
+  echo
+  cmd_start
+}
+
+cmd_status() {
+  local health models_ready
+  if pid_alive "$GRPC_PID"; then
+    ok "gRPC server   running  pid $(cat "$GRPC_PID")  → 127.0.0.1:$GRPC_PORT"
+  elif port_open "$GRPC_PORT"; then
+    warn "gRPC server   running (external)  → 127.0.0.1:$GRPC_PORT"
+  else
+    err "gRPC server   stopped"
+  fi
+
+  if pid_alive "$BRIDGE_PID"; then
+    local host_label
+    if [ "$BRIDGE_HOST" = "127.0.0.1" ]; then host_label="127.0.0.1"; else host_label="$(lan_ip)"; fi
+    ok "bridge        running  pid $(cat "$BRIDGE_PID")  → http://$host_label:$BRIDGE_PORT"
+  elif port_open "$BRIDGE_PORT"; then
+    warn "bridge        running (external)  → 127.0.0.1:$BRIDGE_PORT"
+  else
+    err "bridge        stopped"
+  fi
+
+  if pid_alive "$UI_PID"; then
+    ok "control panel running  pid $(cat "$UI_PID")  → http://127.0.0.1:$UI_PORT"
+  elif port_open "$UI_PORT"; then
+    warn "control panel running (external)  → http://127.0.0.1:$UI_PORT"
+  else
+    info "${c_dim}control panel stopped${c_reset}"
+  fi
+
+  health="$(curl -fsS -m 3 "http://127.0.0.1:$BRIDGE_PORT/healthz" 2>/dev/null)" || {
+    info "${c_dim}health        n/a${c_reset}"
+    return 0
+  }
+  models_ready="$(printf '%s' "$health" | grep -o '"models_ready":[a-z]*' | cut -d: -f2)"
+  if [ "$models_ready" = "true" ]; then
+    ok "health        ok, models visible"
+  else
+    err "health        degraded, models missing:"
+    printf '%s' "$health" | sed -E 's/.*"missing":\[([^]]*)\].*/\1/' | tr ',' '\n' | tr -d '"' | sed 's/^ *//;s/ *$//;/^$/d' | while IFS= read -r f; do printf '  %s\n' "$f"; done
+  fi
+}
+
+cmd_logs() {
+  local which="${1:-bridge}" follow="${2:-}"
+  local file="$BRIDGE_LOG"
+  [ "$which" = "grpc" ] && file="$GRPC_LOG"
+  [ "$which" = "ui" ] && file="$UI_LOG"
+  if [ ! -f "$file" ]; then warn "no log yet at $file"; return 0; fi
+  # Polling noise (health checks) is filtered out on purpose.
+  local noise='GET /healthz|GET /v1/models'
+  if [ "$follow" = "-f" ] || [ "$follow" = "--follow" ]; then
+    tail -n 100 -f "$file" | grep -vE "$noise" || true
+  else
+    tail -n 200 "$file" | grep -vE "$noise" || true
+  fi
+}
+
+cmd_doctor() {
+  local problems=0 health https
+  info "project        $ROOT"
+  info "models dir     $MODELS_DIR"
+  info "gRPC binary    $GRPC_BIN"
+  info "bind           $BRIDGE_HOST:$BRIDGE_PORT"
+  echo
+
+  # --- toolchain -------------------------------------------------------
+  if command -v uv >/dev/null 2>&1; then
+    ok "uv $(uv --version 2>/dev/null | awk '{print $2}')"
+  else
+    err "uv missing - run ./dt setup"
+    problems=$((problems + 1))
+  fi
+
+  if [ -x "$VENV_PY" ]; then
+    if "$VENV_PY" -c 'import fastapi, grpclib, flatbuffers, numpy, PIL, websockets' >/dev/null 2>&1; then
+      ok "python env + dependencies"
+    else
+      err "python dependencies incomplete - run ./dt setup"
+      problems=$((problems + 1))
+    fi
+  else
+    err "virtualenv missing - run ./dt setup"
+    problems=$((problems + 1))
+  fi
+
+  if [ -f "$ROOT/gen/imageService_pb2.py" ] && [ -f "$ROOT/gen/GenerationConfiguration.py" ]; then
+    ok "generated bindings in gen/"
+  else
+    err "gen/ incomplete - run ./dt setup (or ./regen.sh)"
+    problems=$((problems + 1))
+  fi
+
+  # --- draw things -----------------------------------------------------
+  if [ -x "$GRPC_BIN" ]; then
+    ok "gRPC server binary found"
+  elif [ -x "$ROOT/gRPCServerCLI-macOS" ]; then
+    ok "gRPC server binary found in project dir"
+  else
+    err "gRPCServerCLI-macOS missing - run ./dt setup --download-grpc"
+    problems=$((problems + 1))
+  fi
+
+  if [ -d "$MODELS_DIR" ]; then
+    if ls "$MODELS_DIR" >/dev/null 2>&1; then
+      ok "models readable ($(ls "$MODELS_DIR" 2>/dev/null | wc -l | tr -d ' ') files)"
+    else
+      err "models not readable - grant Full Disk Access to Terminal/your editor"
+      problems=$((problems + 1))
+    fi
+  else
+    err "models directory missing ($MODELS_DIR)"
+    problems=$((problems + 1))
+  fi
+
+  # --- settings --------------------------------------------------------
+  [ -f "$ROOT/bridge.env" ] && ok "bridge.env present" || warn "bridge.env missing (defaults will be used)"
+  [ -f "$ROOT/config.json" ] && ok "config.json present" || warn "config.json missing (press l in ./dt tui to load a preset from Draw Things)"
+
+  # --- network ---------------------------------------------------------
+  case "$BRIDGE_HOST" in
+    127.0.0.1) info "${c_dim}exposure       loopback only (n in ./dt tui to change)${c_reset}" ;;
+    *) info "${c_dim}exposure       $BRIDGE_HOST${c_reset}" ;;
+  esac
+
+  https="$("$VENV_PY" -c "import netutil;s=netutil.serve_state($BRIDGE_PORT);u=netutil.https_url();print(u+'/v1' if s.get('enabled') and u else '')" 2>/dev/null || true)"
+  if [ -n "$https" ]; then
+    ok "tailscale https $https"
+  else
+    info "${c_dim}tailscale https off (n then t in ./dt tui)${c_reset}"
+  fi
+
+  port_open "$GRPC_PORT" && info "${c_dim}port $GRPC_PORT busy (gRPC up)${c_reset}" || info "${c_dim}port $GRPC_PORT free${c_reset}"
+  port_open "$BRIDGE_PORT" && info "${c_dim}port $BRIDGE_PORT busy (bridge up)${c_reset}" || info "${c_dim}port $BRIDGE_PORT free${c_reset}"
+
+  echo
+  if health="$(curl -fsS -m 3 "http://127.0.0.1:$BRIDGE_PORT/healthz" 2>/dev/null)"; then
+    info "healthz        $health"
+  else
+    info "healthz        (bridge not running)"
+  fi
+
+  echo
+  if [ "$problems" -eq 0 ]; then
+    ok "no problems found"
+  else
+    err "$problems issue(s) above"
+    info "fix with: ./dt setup"
+    return 1
+  fi
+}
+
+cmd_url() {
+  local ip ts
+  ip="$(lan_ip)"
+  ts="$(tailnet_ip)"
+  info "bind            $BRIDGE_HOST:$BRIDGE_PORT"
+  case "$BRIDGE_HOST" in
+    127.0.0.1)
+      info "${c_dim}LAN / tailnet   loopback only (press n in ./dt tui to expose)${c_reset}" ;;
+    *)
+      info "OpenAI base     http://$ip:$BRIDGE_PORT/v1"
+      info "ComfyUI base    http://$ip:$BRIDGE_PORT"
+      if [ -n "$ts" ]; then
+        info "tailnet http    http://$ts:$BRIDGE_PORT/v1"
+      else
+        info "${c_dim}tailnet         (tailscale not detected)${c_reset}"
+      fi ;;
+  esac
+  info "https           $("$VENV_PY" -c "import netutil;s=netutil.serve_state($BRIDGE_PORT);u=netutil.https_url();print((u or '')+'/v1' if s.get('enabled') and u else 'off (in the TUI: n then t)')" 2>/dev/null || echo 'unknown')"
+  info "health          curl -s http://127.0.0.1:$BRIDGE_PORT/healthz"
+}
+
+usage() {
+  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
+  restart-bridge) cmd_restart_bridge ;;
+  ui) cmd_ui ;;
+  setup) shift; cmd_setup "$@" ;;
+  tui) cmd_tui ;;
+  shutdown) cmd_shutdown ;;
+  status) cmd_status ;;
+  logs) shift; cmd_logs "${1:-bridge}" "${2:-}" ;;
+  doctor) cmd_doctor ;;
+  url|endpoints) cmd_url ;;
+  ""|-h|--help|help) usage ;;
+  *) err "unknown command: $1"; echo; usage; exit 1 ;;
+esac

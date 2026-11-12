@@ -218,3 +218,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------- this project
+# runtime state
+.run/
+output/
+*.log
+
+# local settings (bind address, API key, personal preset)
+bridge.env
+config.json
+
+# downloaded build tools (./setup.sh --tools fetches them)
+tools/
+
+# macOS
+.DS_Store
