@@ -54,7 +54,8 @@ if [ -f "$DENY_FILE" ]; then
   SENSITIVE="$(grep -vE '^[[:space:]]*(#|$)' "$DENY_FILE" | paste -sd'|' -)"
 else
   warn "no .publish-ignore - only generic patterns are checked"
-  SENSITIVE='/Users/'
+  # Written as a character class so the literal path is not in this file.
+  SENSITIVE='/Use[r]s/'
 fi
 if [ -n "$SENSITIVE" ] && git grep -I -n -E "$SENSITIVE" "$TREE" -- . ':(exclude)publish.sh' >/tmp/dt-publish-scan 2>/dev/null; then
   err "refusing to publish: sensitive strings found in the snapshot"
