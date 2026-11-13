@@ -47,9 +47,16 @@ fi
 
 # Scan the exact tree we are about to publish.
 TREE="$(git rev-parse 'HEAD^{tree}')"
-SENSITIVE='pornmaster|asian_babe|breastinclass|leaked_nude|selfie_holding_glowing|easynegative|pure_eros|bad_prompt|swissp|taildb|/Users/'
-# The scanner itself contains this pattern list, so it is excluded.
-if git grep -I -n -E "$SENSITIVE" "$TREE" -- . ':(exclude)publish.sh' >/tmp/dt-publish-scan 2>/dev/null; then
+# The word list lives in .publish-ignore (git-ignored) so the words themselves
+# are not published either. Without it we can still catch paths and keys.
+DENY_FILE="$ROOT/.publish-ignore"
+if [ -f "$DENY_FILE" ]; then
+  SENSITIVE="$(grep -vE '^[[:space:]]*(#|$)' "$DENY_FILE" | paste -sd'|' -)"
+else
+  warn "no .publish-ignore - only generic patterns are checked"
+  SENSITIVE='/Users/'
+fi
+if [ -n "$SENSITIVE" ] && git grep -I -n -E "$SENSITIVE" "$TREE" -- . ':(exclude)publish.sh' >/tmp/dt-publish-scan 2>/dev/null; then
   err "refusing to publish: sensitive strings found in the snapshot"
   sed -n '1,10p' /tmp/dt-publish-scan | sed 's/^/    /'
   exit 1
