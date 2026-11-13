@@ -85,32 +85,43 @@ BRIDGE_API_KEY=            # optional bearer token for /v1/*
 
 ### Presets straight from Draw Things
 
-The app stores every generation as a `TensorHistoryNode` row in its SQLite
-workspace. `dtconfig.py` reads those rows and `l` in the TUI lists them,
-newest first (by the node's `wall_clock`), with a live filter:
+The picker merges two sources from the app:
+
+1. **Named presets** (`★`) — read from `Documents/Models/custom_configs.json`,
+   i.e. configurations you saved in Draw Things with **Save configuration**.
+   These are listed first because they are the only place a preset keeps its name.
+2. **Recent generations** — read from the per-project SQLite workspaces
+   (`TensorHistoryNode`), newest first by `wall_clock`.
 
 ```
-┌ Load preset · 9/42 · newest first ───────────────────────────────────────────┐
-│ filter: sdxl                                                                 │
-│ 11-02 02:34  768x576    18st DPMPP2MKarras l2   sd_xl_base_1.0…  a cozy…     │
+┌ Load preset · 44/44 · newest first ──────────────────────────────────────────┐
+│ filter:                                                                      │
+│            ★AAA           1024x1344   5st LCM           l5                   │
+│            ★SDLCM8bits     768x512   26st DPMPP2MKarras l1                   │
+│ 11-02 02:48 SD1.5LCM      1024x1344   5st LCM           l5  selfie face…     │
 └ type to filter · ↑↓ select · Enter load · Esc cancel ────────────────────────┘
 ```
 
-Typing filters on prompt, model name and LoRA filenames (space = AND). `Esc`
-clears the filter, a second `Esc` closes the picker.
+Typing filters on preset name, prompt, model, sampler, project and LoRA
+filenames (space = AND). `Esc` clears the filter, a second `Esc` closes.
 
 Loading a preset pushes model, LoRAs, steps, sampler, cfg, clip-skip, size,
 hires-fix and upscaler into the running bridge (`POST /admin/config`, which also
 rewrites `config.json`). The stored seed is dropped so generations stay random,
 and inline `<lora:...>` tags are stripped from the prompt because the LoRA list
-already carries them. Tune in the Draw Things app, generate one image you like,
-then load that preset here - no manual copying of values.
+already carries them. Tune in the Draw Things app, save or generate something
+you like, then load it here - no manual copying of values.
+
+Textual inversions (`custom_textual_inversions.json`) are checked by
+`./dt doctor`; the bridge itself does not need them because Draw Things loads an
+embedding whenever its keyword appears in the prompt.
 
 Inspect the presets without the UI:
 
 ```sh
-.venv/bin/python dtconfig.py --limit 15        # table
-.venv/bin/python dtconfig.py --json --limit 5  # raw entries
+.venv/bin/python dtconfig.py --named          # named presets only
+.venv/bin/python dtconfig.py --limit 15       # recent history
+.venv/bin/python dtconfig.py --summary        # counts + missing TI files
 ```
 
 ### Custom models & external folders
@@ -287,3 +298,45 @@ Point the client at `http://<lan-ip>:9955` (no `/v1` suffix for ComfyUI).
 - `schema/config.fbs` → `GenerationConfiguration.py`, `LoRA.py`, enums
 - `schema/tensor_history.fbs` → `TensorHistoryNode.py` (used by `dtconfig.py` to
   read Draw Things' own history DB)
+
+## Publishing (public mirror)
+
+This repository is the development copy. A sanitised snapshot is published to a
+separate public mirror by `./publish.sh`:
+
+```sh
+./publish.sh --dry-run     # show the diff that would be published
+./publish.sh               # publish
+```
+
+How it works: the script takes the **tree** of the current commit, scans it for
+personal strings (model/LoRA names, home paths, tokens) and aborts if anything
+matches, then creates one commit whose parent is the mirror's current tip and
+pushes only that. Private history is never published, so an early commit that
+carried personal defaults cannot leak.
+
+Configure the target with `DT_PUBLIC_REPO` / `DT_PUBLIC_ACCOUNT` (defaults are
+set inside the script).
+
+## Troubleshooting
+
+**`git push` fails with `Repository not found` on a machine with several GitHub
+accounts** - git resolved credentials for the wrong account; a token without
+access to a private repo is answered with 404. Check which account git uses:
+
+```sh
+printf 'protocol=https\nhost=github.com\n\n' | git credential fill | grep username
+```
+
+Then pin this repository to `gh`'s active account:
+
+```sh
+gh auth switch --user <your-account>
+git config --local --unset-all credential.https://github.com.helper
+git config --local --add credential.https://github.com.helper ''
+git config --local --add credential.https://github.com.helper '!gh auth git-credential'
+```
+
+**`/healthz` reports `models_ready: false`** - the gRPC server cannot read the
+Models folder. Grant Full Disk Access to the terminal you launch `./dt` from
+(System Settings → Privacy & Security → Full Disk Access), then restart it.

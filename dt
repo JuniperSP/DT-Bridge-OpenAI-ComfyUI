@@ -482,6 +482,28 @@ cmd_doctor() {
   [ -f "$ROOT/bridge.env" ] && ok "bridge.env present" || warn "bridge.env missing (defaults will be used)"
   [ -f "$ROOT/config.json" ] && ok "config.json present" || warn "config.json missing (press l in ./dt tui to load a preset from Draw Things)"
 
+  # --- Draw Things presets / embeddings ---------------------------------
+  if [ -x "$VENV_PY" ]; then
+    local summary named ti miss
+    summary="$("$VENV_PY" -c 'import json,dtconfig;print(json.dumps({"n":len(dtconfig.custom_configs()),"ti":len(dtconfig.textual_inversions()),"miss":dtconfig.missing_textual_inversions()},separators=(",",":")))' 2>/dev/null)"
+    if [ -n "$summary" ]; then
+      named="$(printf '%s' "$summary" | sed -E 's/.*"n":([0-9]+).*/\1/')"
+      ti="$(printf '%s' "$summary" | sed -E 's/.*"ti":([0-9]+).*/\1/')"
+      miss="$(printf '%s' "$summary" | sed -E 's/.*"miss":\[([^]]*)\].*/\1/' | tr -d '" ')"
+      if [ "${named:-0}" -gt 0 ]; then
+        ok "named presets: $named (from custom_configs.json)"
+      else
+        warn "no named presets - use Save configuration in Draw Things"
+      fi
+      if [ -n "$miss" ]; then
+        err "textual inversion file(s) missing: $miss"
+        problems=$((problems + 1))
+      elif [ "${ti:-0}" -gt 0 ]; then
+        ok "textual inversions: $ti (files present)"
+      fi
+    fi
+  fi
+
   # --- network ---------------------------------------------------------
   case "$BRIDGE_HOST" in
     127.0.0.1) info "${c_dim}exposure       loopback only (n in ./dt tui to change)${c_reset}" ;;

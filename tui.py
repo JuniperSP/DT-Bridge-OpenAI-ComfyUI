@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import netutil
-from dtconfig import bridge_settings, clean_prompt, recent_configs
+from dtconfig import all_presets, bridge_settings, clean_prompt
 
 ROOT = Path(__file__).resolve().parent
 STATE = ROOT / ".run"
@@ -328,6 +328,7 @@ def _match(entry: dict[str, Any], query: str) -> bool:
     hay = " ".join(
         [
             entry.get("prompt", ""),
+            entry.get("name", ""),
             entry.get("model", ""),
             entry.get("sampler", ""),
             entry.get("source", ""),
@@ -352,7 +353,7 @@ def open_picker() -> None:
 
     def work() -> None:
         try:
-            items = [entry for entry in recent_configs(60) if (entry.get("prompt") or "").strip()]
+            items = all_presets(60)
             if items:
                 S["picker"] = {
                     "items": items,
@@ -393,7 +394,8 @@ def apply_preset(entry: dict[str, Any]) -> None:
             )
             with urllib.request.urlopen(request, timeout=15) as res:
                 json.loads(res.read())
-            S["message"] = f"loaded {entry['source']}#{entry['rowid']} · {label}"
+            name = entry.get("name") or f"{entry['source']}#{entry['rowid']}"
+            S["message"] = f"loaded {name} · {label}"
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             # Bridge down: keep the file so the next start picks it up.
             try:
@@ -445,12 +447,14 @@ def draw_picker(scr: Any) -> None:
         if i >= len(items):
             break
         entry = items[i]
+        named = entry.get("name") or ""
         source = (entry.get("source") or "").removesuffix(".sqlite3")[:13]
+        lead = f"★{named[:12]:<12} " if named else f"{source:<13}"
         text = (
-            f"{entry.get('modified', ''):<11} {source:<13}"
+            f"{entry.get('modified', ''):<11} {lead}"
             f"{entry['width']}x{entry['height']:<5} {entry['steps']:>2}st "
             f"{entry['sampler']:<13} l{len(entry['loras'])} "
-            f"{entry['prompt'][:34]}"
+            f"{entry['prompt'][:30]}"
         )
         attr = curses.A_REVERSE if i == index else 0
         put(scr, top + 2 + row, left + 2, " " * (box_w - 4), attr)
