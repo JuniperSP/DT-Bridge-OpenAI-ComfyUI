@@ -5,7 +5,8 @@
 # Why a snapshot and not a normal push: this repository's history still contains
 # an early commit with personal model/LoRA names, so publishing our history
 # would leak them. Instead we build ONE commit whose tree is the current HEAD
-# and whose parent is the public repo's current tip, then push that.
+# (minus the development-only files listed below) and whose parent is the public
+# repo's current tip, then push that.
 #
 #   ./publish.sh [--dry-run] [--message "text"]
 set -uo pipefail
@@ -45,8 +46,24 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
+# Files that live in the development repository but must never reach the public
+# mirror. AGENTS.md is agent guidance for this side of the project only.
+EXCLUDE_PATHS=(AGENTS.md)
+
 # Scan the exact tree we are about to publish.
 TREE="$(git rev-parse 'HEAD^{tree}')"
+
+# Rebuild the tree without the excluded paths (git can only filter through an
+# index, so use a throwaway one).
+TMP_INDEX="$(mktemp -t dt-publish-index)"
+rm -f "$TMP_INDEX"
+GIT_INDEX_FILE="$TMP_INDEX" git read-tree "$TREE" || die "cannot stage the snapshot tree"
+for p in "${EXCLUDE_PATHS[@]}"; do
+  GIT_INDEX_FILE="$TMP_INDEX" git rm -r -q --cached --ignore-unmatch -- "$p" >/dev/null 2>&1 || true
+done
+TREE="$(GIT_INDEX_FILE="$TMP_INDEX" git write-tree)" || die "cannot write the snapshot tree"
+rm -f "$TMP_INDEX"
+ok "snapshot excludes: ${EXCLUDE_PATHS[*]}"
 # The word list lives in .publish-ignore (git-ignored) so the words themselves
 # are not published either. Without it we can still catch paths and keys.
 DENY_FILE="$ROOT/.publish-ignore"
