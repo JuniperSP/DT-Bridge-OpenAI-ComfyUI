@@ -40,6 +40,22 @@ SAMPLER_NAMES = [
 SEED_MODE_NAMES = ["Legacy", "TorchCpuCompatible", "ScaleAlike", "NvidiaGpuCompatible"]
 LORA_MODE_NAMES = ["all", "base", "refiner"]
 COLOR_CALIBRATION_NAMES = ["none", "lab"]
+COMPRESSION_ARTIFACT_NAMES = ["disabled", "h264", "h265", "jpeg"]
+
+# Entry-level metadata that is never part of a Draw Things configuration.
+META_KEYS = frozenset(
+    {
+        "source",
+        "rowid",
+        "name",
+        "prompt",
+        "negative",
+        "modified",
+        "wallClock",
+        "generationTime",
+        "configuration",
+    }
+)
 
 
 def _name(table: list[str], index: int, default: str = "") -> str:
@@ -95,6 +111,17 @@ def _entry(db: Path, rowid: int, blob: bytes) -> dict[str, Any] | None:
                     "mode": _name(LORA_MODE_NAMES, lora.Mode(), "all"),
                 }
             )
+        controls = []
+        for i in range(node.ControlsLength()):
+            control = node.Controls(i)
+            if control is None:
+                continue
+            controls.append(
+                {
+                    "file": _str(control.File()),
+                    "weight": float(control.Weight()),
+                }
+            )
         return {
             "source": db.name,
             "rowid": rowid,
@@ -128,7 +155,70 @@ def _entry(db: Path, rowid: int, blob: bytes) -> dict[str, Any] | None:
             "preserveOriginalAfterInpaint": bool(node.PreserveOriginalAfterInpaint()),
             "colorCalibration": _name(COLOR_CALIBRATION_NAMES, int(node.ColorCalibration()), "none"),
             "batchSize": int(node.BatchSize()),
-            "numFrames": int(node.NumFrames()) or 1,
+            # The bridge renders still images, and Draw Things leaves num_frames
+            # at its schema default (14) even for stills.
+            "numFrames": 1,
+            "imageGuidanceScale": float(node.ImageGuidanceScale()),
+            "clipWeight": float(node.ClipWeight()),
+            "negativePromptForImagePrior": bool(node.NegativePromptForImagePrior()),
+            "imagePriorSteps": int(node.ImagePriorSteps()),
+            "originalImageWidth": int(node.OriginalImageWidth()),
+            "originalImageHeight": int(node.OriginalImageHeight()),
+            "targetImageWidth": int(node.TargetImageWidth()),
+            "targetImageHeight": int(node.TargetImageHeight()),
+            "negativeOriginalImageWidth": int(node.NegativeOriginalImageWidth()),
+            "negativeOriginalImageHeight": int(node.NegativeOriginalImageHeight()),
+            "cropTop": int(node.CropTop()),
+            "cropLeft": int(node.CropLeft()),
+            "aestheticScore": float(node.AestheticScore()),
+            "negativeAestheticScore": float(node.NegativeAestheticScore()),
+            "zeroNegativePrompt": bool(node.ZeroNegativePrompt()),
+            "guidingFrameNoise": float(node.CondAug()),
+            "fps": int(node.FpsId()),
+            "motionScale": int(node.MotionBucketId()),
+            "startFrameGuidance": float(node.StartFrameCfg()),
+            "stage2Steps": int(node.Stage2Steps()),
+            "stage2Guidance": float(node.Stage2Cfg()),
+            "stage2Shift": float(node.Stage2Shift()),
+            "stochasticSamplingGamma": float(node.StochasticSamplingGamma()),
+            "upscalerScaleFactor": int(node.UpscalerScaleFactor()),
+            "t5TextEncoder": bool(node.T5TextEncoder()),
+            "separateT5": bool(node.SeparateT5()),
+            "t5Text": _str(node.T5Text()),
+            "separateClipL": bool(node.SeparateClipL()),
+            "clipLText": _str(node.ClipLText()),
+            "separateOpenClipG": bool(node.SeparateOpenClipG()),
+            "openClipGText": _str(node.OpenClipGText()),
+            "speedUpWithGuidanceEmbed": bool(node.SpeedUpWithGuidanceEmbed()),
+            "guidanceEmbed": float(node.GuidanceEmbed()),
+            "resolutionDependentShift": bool(node.ResolutionDependentShift()),
+            "teaCache": bool(node.TeaCache()),
+            "teaCacheStart": int(node.TeaCacheStart()),
+            "teaCacheEnd": int(node.TeaCacheEnd()),
+            "teaCacheThreshold": float(node.TeaCacheThreshold()),
+            "teaCacheMaxSkipSteps": int(node.TeaCacheMaxSkipSteps()),
+            "causalInference": int(node.CausalInference()),
+            "causalInferencePad": int(node.CausalInferencePad()),
+            "cfgZeroStar": bool(node.CfgZeroStar()),
+            "cfgZeroInitSteps": int(node.CfgZeroInitSteps()),
+            "compressionArtifacts": _name(
+                COMPRESSION_ARTIFACT_NAMES, int(node.CompressionArtifacts()), "disabled"
+            ),
+            "compressionArtifactsQuality": float(node.CompressionArtifactsQuality()),
+            "expandPromptToJson": bool(node.ExpandPromptToJson()),
+            "shiftForAudio": float(node.ShiftForAudio()),
+            "usesSolAttention": bool(node.UsesSolAttention()),
+            "solAttentionStart": int(node.SolAttentionStart()),
+            "solAttentionTau": float(node.SolAttentionTau()),
+            # Tile sizes are stored in 64 px blocks here, in pixels in the app's
+            # saved configurations; normalise to pixels like custom_configs().
+            "decodingTileWidth": int(node.DecodingTileWidth()) * 64,
+            "decodingTileHeight": int(node.DecodingTileHeight()) * 64,
+            "decodingTileOverlap": int(node.DecodingTileOverlap()) * 64,
+            "diffusionTileWidth": int(node.DiffusionTileWidth()) * 64,
+            "diffusionTileHeight": int(node.DiffusionTileHeight()) * 64,
+            "diffusionTileOverlap": int(node.DiffusionTileOverlap()) * 64,
+            "controls": controls,
             "generationTime": float(node.GenerationTime()),
             "wallClock": int(node.WallClock()),
             "modified": _stamp(int(node.WallClock())),
@@ -270,6 +360,9 @@ def custom_configs() -> list[dict[str, Any]]:
                 "batchSize": _int(config.get("batchSize"), 1),
                 "numFrames": _int(config.get("numFrames"), 1) or 1,
                 "generationTime": 0.0,
+                # Keep the app's own configuration so bridge_settings() can pass
+                # every key through, not just the handful summarised above.
+                "configuration": config,
             }
         )
     return entries
@@ -313,15 +406,34 @@ def clean_prompt(text: str) -> str:
 
 
 def bridge_settings(entry: dict[str, Any]) -> dict[str, Any]:
-    """Subset of a Draw Things preset that the bridge's config.json accepts."""
-    keys = (
-        "model", "steps", "guidanceScale", "strength", "sampler", "seedMode", "seed",
-        "clipSkip", "shift", "sharpness", "maskBlur", "maskBlurOutset", "width", "height",
-        "batchSize", "hiresFix", "hiresFixStrength", "hiresFixWidth", "hiresFixHeight",
-        "upscaler", "faceRestoration", "refinerModel", "refinerStart", "colorCalibration",
-        "tiledDecoding", "tiledDiffusion", "preserveOriginalAfterInpaint", "numFrames", "loras",
-    )
-    return {key: entry[key] for key in keys if key in entry}
+    """The whole configuration a Draw Things preset stands for.
+
+    Keys keep the app's own spelling (pixels for tile sizes, enum names instead
+    of numbers) so a preset can be written into config.json unchanged;
+    bridge.build_configuration knows the FlatBuffer mapping. A stored seed is
+    dropped on purpose: it would freeze every generation.
+    """
+    source = entry.get("configuration")
+    if not isinstance(source, dict):
+        source = entry
+    return {
+        key: value
+        for key, value in source.items()
+        if key not in META_KEYS and key != "seed"
+    }
+
+
+def preset_notes(entry: dict[str, Any]) -> list[str]:
+    """What the client must know after loading this preset."""
+    settings = bridge_settings(entry)
+    controls = [
+        control
+        for control in settings.get("controls") or []
+        if isinstance(control, dict) and control.get("file")
+    ]
+    if not controls:
+        return []
+    return [f"ControlNet x{len(controls)}: requests need a control image too"]
 
 
 if __name__ == "__main__":

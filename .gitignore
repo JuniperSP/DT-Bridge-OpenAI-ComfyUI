@@ -223,6 +223,7 @@ __marimo__/
 # runtime state
 .run/
 output/
+input/
 *.log
 
 # local settings (bind address, API key, personal preset, local models drop-folder)

@@ -105,12 +105,27 @@ The picker merges two sources from the app:
 Typing filters on preset name, prompt, model, sampler, project and LoRA
 filenames (space = AND). `Esc` clears the filter, a second `Esc` closes.
 
-Loading a preset pushes model, LoRAs, steps, sampler, cfg, clip-skip, size,
-hires-fix and upscaler into the running bridge (`POST /admin/config`, which also
-rewrites `config.json`). The stored seed is dropped so generations stay random,
-and inline `<lora:...>` tags are stripped from the prompt because the LoRA list
-already carries them. Tune in the Draw Things app, save or generate something
-you like, then load it here - no manual copying of values.
+Loading a preset pushes the whole configuration into the running bridge
+(`POST /admin/config`, which also rewrites `config.json`): model, LoRAs
+(file/weight/mode), steps, sampler, seed mode, cfg, clip-skip, size, hires-fix,
+upscaler + scale factor, refiner, face restoration, mask blur, tiling **and its
+tile sizes**, multi-stage sampler knobs, text-encoder switches, tea-cache, CFG
+zero, prompt expansion, colour calibration, compression and the video/audio
+fields - i.e. every key the app stores except the ones listed below. The stored
+seed is dropped so generations stay random, and inline `<lora:...>` tags are
+stripped from the prompt because the LoRA list already carries them. Tune in the
+Draw Things app, save or generate something you like, then load it here - no
+manual copying of values.
+
+Two things do not travel yet:
+
+- `controls` (ControlNet) needs a source image, so it is skipped and reported
+  instead of being dropped silently: `/healthz` then lists `"unsupported":
+  ["controls"]` and the TUI shows `not sent: controls` after loading.
+- `name` is preset metadata, not a generation setting.
+
+The bridge writes pixel sizes; the FlatBuffer wants 64 px blocks, so widths,
+heights and tile sizes are converted on the way out.
 
 Textual inversions (`custom_textual_inversions.json`) are checked by
 `./dt doctor`; the bridge itself does not need them because Draw Things loads an
@@ -192,6 +207,8 @@ have a gRPC server running by hand it reuses it and says so.
 | Method | Path | Notes |
 |---|---|---|
 | `POST` | `/v1/images/generations` | `prompt`, `n`, `size`, `response_format`, plus extras below |
+| `POST` | `/v1/images/edits` | multipart img2img: `image` + `prompt` (+ `strength`, optional `control_image`/`control_type`) |
+| `POST` | `/upload/image` | ComfyUI's upload endpoint; stores a source image for `LoadImage` |
 | `GET`  | `/v1/models` | lists the configured model |
 |`GET` | `/healthz` | pings the server and reports missing model/lora files |
 | `GET`/`POST` | `/admin/config` | read or live-update the generation settings (also rewrites `config.json`) |
@@ -221,6 +238,16 @@ to `bridge.py` manually:
   "loras": [{ "file": "lcm_sd_xl_base_1.0_lora_f16.ckpt", "weight": 1.0, "mode": "all" }]
 }
 ```
+
+`config.json` accepts every key Draw Things writes into a preset, spelled the
+same way (`resolutionDependentShift`, `stage2Steps`, `teaCacheThreshold`, ...),
+so a saved configuration can be pasted in as-is. Units follow the app: sizes and
+tile widths in pixels, sampler/seed-mode/colour/compression enums as either
+numbers or names. Anything missing falls back to `DEFAULT_SETTINGS`.
+
+`controls` is accepted, stored and sent: the ControlNet models come from the
+preset and each request supplies its own control image (see ControlNet above).
+`/healthz` lists the loaded control models under `controls`.
 
 Environment variables: `DT_ADDR`, `DT_PORT`, `DT_TLS` (1 = TLS + ALPN `h2`),
 `BRIDGE_HOST`, `BRIDGE_PORT`, `BRIDGE_API_KEY`, `DT_TIMEOUT`, `DT_CONFIG`.
@@ -264,17 +291,48 @@ The graph is not executed - it is inspected for the values that matter:
 | width / height / batch | `EmptyLatentImage` (or `EmptySD3LatentImage`) reached from `latent_image` |
 | seed | `KSampler.seed` / `KSamplerAdvanced.noise_seed` (random when absent) |
 | filename | `SaveImage.filename_prefix` → `ComfyUI_00001_.png` |
+| source image | `LoadImage.image` → a file uploaded through `/upload/image` |
+| strength | `KSampler.denoise` (0–1), only when a `LoadImage` node is present |
+| control image | `LoadImage` wired into `ControlNetApply*` (sent as a `custom` hint) |
 
 Everything else (`steps`, `cfg`, `sampler_name`, `scheduler`, `ckpt_name`,
 `LoraLoader`, `VAEDecode`) is **ignored on purpose** - steps/sampler/LoRAs come
 from `config.json` so every client renders with the same tuned pipeline.
 Workflows with no usable prompt return HTTP 400 with `node_errors` instead of
-silently producing the wrong picture. img2img / `LoadImage` graphs are not
-supported yet.
+silently producing the wrong picture.
+
+img2img works the way ComfyUI clients expect: POST the picture to
+`/upload/image`, then reference the returned name from a `LoadImage` node and
+set `KSampler.denoise` to the strength you want. If the workflow never sizes a
+latent, the source image's own size (snapped to 64 px) is used. Inpainting
+(`LoadImageMask` / `mask`) is not wired yet.
+
+### ControlNet
+
+Draw Things receives *pre-processed* hints, not photos, so a control needs two
+pieces: the control entries from the preset (`controls` in `config.json`) and a
+control image per request.
+
+- **OpenAI surface** — POST the control picture as `control_image` next to the
+  normal fields, with `control_type` naming the map you are sending (`pose`,
+  `depth`, `canny`, `lineart`, `tile`, ...; default `custom`).
+- **ComfyUI surface** — wire a `LoadImage` into `ControlNetApplyAdvanced`; it
+  travels as a `custom` hint. `ControlNetLoader.control_net_name` is ignored:
+  the control model comes from the preset.
+
+Without a control image the control entries have no effect at all (same picture
+as with no control). `scribble` hints need a 1-byte tensor and answer 501.
 
 Point the client at `http://<lan-ip>:9955` (no `/v1` suffix for ComfyUI).
 
 ## Implementation notes
+
+- Source images (img2img, `LoadImage`) are converted to Draw Things' own NNC
+  tensor frame - `[u32 identifier=0][64B param][fp16 NHWC]`, pixels in [-1, 1] -
+  and referenced by `sha256` in `contents`. The server never accepts PNG/JPEG for
+  `image`, and a PNG payload hangs it without a log line.
+- Sizes are capped at `DT_MAX_SIZE` (default 2048 px) because a MacBook swaps or
+  drops requests below what a cloud GPU would allow.
 
 - `size` is snapped to multiples of 64 px; Draw Things takes
   `start_width` in 64 px units.

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import netutil
-from dtconfig import all_presets, bridge_settings, clean_prompt
+from dtconfig import all_presets, bridge_settings, clean_prompt, preset_notes
 
 ROOT = Path(__file__).resolve().parent
 STATE = ROOT / ".run"
@@ -379,12 +379,13 @@ def apply_preset(entry: dict[str, Any]) -> None:
     S["message"] = "applying preset…"
     S["dirty"] = True
     settings = bridge_settings(entry)
-    # A stored seed would freeze every generation; keep it random instead.
-    settings.pop("seed", None)
     S["preset_prompt"] = clean_prompt(entry.get("prompt", ""))
+    notes = preset_notes(entry)
 
     def work() -> None:
         label = f"{settings.get('width')}x{settings.get('height')} · {settings.get('steps')} steps · {settings.get('sampler')}"
+        if notes:
+            label += f" · {', '.join(notes)}"
         try:
             body = json.dumps(settings).encode()
             request = urllib.request.Request(

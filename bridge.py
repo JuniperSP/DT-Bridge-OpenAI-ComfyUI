@@ -7,6 +7,7 @@
 #     "protobuf",
 #     "numpy",
 #     "pillow",
+#     "python-multipart",
 #     "websockets",
 # ]
 # ///
@@ -34,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -55,10 +57,12 @@ from grpclib.client import Channel
 from grpclib.const import Cardinality
 from PIL import Image
 from pydantic import BaseModel
+from starlette.datastructures import UploadFile
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "gen"))
 
+import Control as ControlFB
 import GenerationConfiguration as GC
 import imageService_pb2 as _pb
 import LoRA as LoRAFB
@@ -78,9 +82,22 @@ CONFIG_PATH = Path(os.environ.get("DT_CONFIG", str(HERE / "config.json")))
 
 # Serialized tensor layout produced by NNC's Tensor.data(using:):
 #   [uint32 identifier][ccv_nnc_tensor_param_t 64B][raw data]
+# identifier 0 means uncompressed, which the server accepts for request inputs
+# (the app itself only bundles fpzip for decompressing responses).
 TENSOR_HEADER = 68
+CCV_TENSOR_CPU_MEMORY = 0x1
+CCV_TENSOR_FORMAT_NHWC = 0x02
+CCV_16F = 0x20000
 IMAGE_DIR = HERE / "output"
 IMAGE_DIR.mkdir(exist_ok=True)
+# Source images uploaded by ComfyUI clients (LoadImage) live apart from outputs.
+INPUT_DIR = HERE / "input"
+INPUT_DIR.mkdir(exist_ok=True)
+UPLOAD_MAX_BYTES = 32 * 1024 * 1024
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+# A MacBook renders 1344 px and friends comfortably; beyond this unified memory
+# pressure makes Draw Things swap or drop the request.
+MAX_IMAGE_SIZE = int(os.environ.get("DT_MAX_SIZE", "2048"))
 
 # Draw Things enums (see schema/config.fbs).
 SAMPLERS = {
@@ -108,9 +125,45 @@ SAMPLERS = {
 SEED_MODES = {"Legacy": 0, "TorchCpuCompatible": 1, "ScaleAlike": 2, "NvidiaGpuCompatible": 3}
 LORA_MODES = {"all": 0, "base": 1, "refiner": 2}
 COLOR_CALIBRATIONS = {"none": 0, "disabled": 0, "lab": 1}
+COMPRESSION_ARTIFACTS = {"disabled": 0, "none": 0, "h264": 1, "h265": 2, "jpeg": 3}
+CONTROL_MODES = {"balanced": 0, "prompt": 1, "control": 2}
+CONTROL_INPUT_TYPES = {
+    "": 0,
+    "unspecified": 0,
+    "custom": 1,
+    "depth": 2,
+    "canny": 3,
+    "scribble": 4,
+    "pose": 5,
+    "normalbae": 6,
+    "color": 7,
+    "lineart": 8,
+    "softedge": 9,
+    "seg": 10,
+    "inpaint": 11,
+    "ip2p": 12,
+    "shuffle": 13,
+    "mlsd": 14,
+    "tile": 15,
+    "blur": 16,
+    "lowquality": 17,
+    "gray": 18,
+}
+# Hint types the server accepts as ControlHintType names. "scribble" wants a
+# 1-byte mask tensor, which this bridge does not build yet.
+HINT_TYPES = tuple(
+    name for name in CONTROL_INPUT_TYPES if name not in ("", "unspecified", "scribble")
+)
+
+# Preset keys the bridge cannot honour yet. They are surfaced by /healthz and the
+# TUI instead of being dropped silently.
+UNSUPPORTED_SETTINGS: dict[str, str] = {}
 
 # Built-in fallback defaults before a Draw Things preset is loaded into config.json.
+# Key names and values follow the app's own preset format, so a preset can be
+# dropped into config.json unchanged.
 DEFAULT_SETTINGS: dict[str, Any] = {
+    # Core sampling
     "model": "",
     "steps": 20,
     "guidanceScale": 7.0,
@@ -121,26 +174,93 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "clipSkip": 1,
     "shift": 1.0,
     "sharpness": 0.0,
-    "maskBlur": 2.5,
-    "maskBlurOutset": 0,
+    # Size / batching
     "width": 512,
     "height": 512,
     "batchCount": 1,
     "batchSize": 1,
+    "numFrames": 1,
+    # Hires fix / upscaling
     "hiresFix": False,
     "hiresFixStrength": 0.7,
     "hiresFixWidth": 0,
     "hiresFixHeight": 0,
     "upscaler": "",
-    "faceRestoration": "",
+    "upscalerScaleFactor": 0,
+    # Layers applied on top of the checkpoint
+    "loras": [],
+    "controls": [],
     "refinerModel": "",
     "refinerStart": 0.7,
-    "colorCalibration": "none",
+    "faceRestoration": "",
+    # Masking, tiling, colour
+    "maskBlur": 2.5,
+    "maskBlurOutset": 0,
     "tiledDecoding": False,
     "tiledDiffusion": False,
+    "decodingTileWidth": 640,
+    "decodingTileHeight": 640,
+    "decodingTileOverlap": 128,
+    "diffusionTileWidth": 1024,
+    "diffusionTileHeight": 1024,
+    "diffusionTileOverlap": 128,
     "preserveOriginalAfterInpaint": True,
-    "numFrames": 1,
-    "loras": [],
+    "colorCalibration": "none",
+    # Guidance and prompt handling
+    "clipWeight": 1.0,
+    "zeroNegativePrompt": False,
+    "aestheticScore": 6.0,
+    "negativeAestheticScore": 2.5,
+    "imageGuidanceScale": 1.5,
+    "imagePriorSteps": 5,
+    "negativePromptForImagePrior": True,
+    "guidanceEmbed": 3.5,
+    "speedUpWithGuidanceEmbed": True,
+    "stochasticSamplingGamma": 0.3,
+    "resolutionDependentShift": True,
+    # Source-image geometry (img2img / inpaint; ignored by txt2img requests)
+    "originalImageWidth": 0,
+    "originalImageHeight": 0,
+    "targetImageWidth": 0,
+    "targetImageHeight": 0,
+    "cropLeft": 0,
+    "cropTop": 0,
+    "negativeOriginalImageWidth": 0,
+    "negativeOriginalImageHeight": 0,
+    # Multi-stage samplers (SD3.5 / HiDream)
+    "stage2Steps": 10,
+    "stage2Guidance": 1.0,
+    "stage2Shift": 1.0,
+    # Video and audio knobs (stored so presets round-trip; the bridge renders stills)
+    "fps": 5,
+    "motionScale": 127,
+    "guidingFrameNoise": 0.02,
+    "startFrameGuidance": 1.0,
+    "shiftForAudio": 3.0,
+    "usesSolAttention": False,
+    "solAttentionStart": 2,
+    "solAttentionTau": 0.5,
+    "causalInference": 0,
+    "causalInferencePad": 0,
+    "cfgZeroStar": False,
+    "cfgZeroInitSteps": 0,
+    # Text encoders (SDXL / FLUX)
+    "t5TextEncoder": True,
+    "separateT5": False,
+    "t5Text": "",
+    "separateClipL": False,
+    "clipLText": "",
+    "separateOpenClipG": False,
+    "openClipGText": "",
+    # Caching, compression, prompt expansion
+    "teaCache": False,
+    "teaCacheStart": 5,
+    "teaCacheEnd": -1,
+    "teaCacheThreshold": 0.06,
+    "teaCacheMaxSkipSteps": 3,
+    "compressionArtifacts": "disabled",
+    "compressionArtifactsQuality": 43.1,
+    "expandPromptToJson": False,
 }
 
 
@@ -159,7 +279,117 @@ SETTINGS = load_settings()
 def _enum(value: Any, table: dict[str, int], default: int = 0) -> int:
     if isinstance(value, int):
         return value
-    return table.get(str(value), default)
+    name = str(value)
+    if name in table:
+        return table[name]
+    # Presets spell enums in different cases ("all" vs "All", "disabled" vs "Disabled").
+    folded = name.lower()
+    for key, index in table.items():
+        if key.lower() == folded:
+            return index
+    return default
+
+
+# Field tables. Draw Things preset keys map onto FlatBuffer fields that are not
+# always the snake_case spelling, and a few of them use different units.
+_SCALAR_FIELDS: tuple[tuple[str, str, Any], ...] = (
+    ("steps", "Steps", int),
+    ("guidanceScale", "GuidanceScale", float),
+    ("strength", "Strength", float),
+    ("clipSkip", "ClipSkip", int),
+    ("shift", "Shift", float),
+    ("sharpness", "Sharpness", float),
+    ("maskBlur", "MaskBlur", float),
+    ("maskBlurOutset", "MaskBlurOutset", int),
+    ("hiresFix", "HiresFix", bool),
+    ("hiresFixStrength", "HiresFixStrength", float),
+    ("refinerStart", "RefinerStart", float),
+    ("numFrames", "NumFrames", int),
+    ("preserveOriginalAfterInpaint", "PreserveOriginalAfterInpaint", bool),
+    ("tiledDecoding", "TiledDecoding", bool),
+    ("tiledDiffusion", "TiledDiffusion", bool),
+    ("upscalerScaleFactor", "UpscalerScaleFactor", int),
+    ("clipWeight", "ClipWeight", float),
+    ("zeroNegativePrompt", "ZeroNegativePrompt", bool),
+    ("aestheticScore", "AestheticScore", float),
+    ("negativeAestheticScore", "NegativeAestheticScore", float),
+    ("imageGuidanceScale", "ImageGuidanceScale", float),
+    ("imagePriorSteps", "ImagePriorSteps", int),
+    ("negativePromptForImagePrior", "NegativePromptForImagePrior", bool),
+    ("guidanceEmbed", "GuidanceEmbed", float),
+    ("speedUpWithGuidanceEmbed", "SpeedUpWithGuidanceEmbed", bool),
+    ("stochasticSamplingGamma", "StochasticSamplingGamma", float),
+    ("resolutionDependentShift", "ResolutionDependentShift", bool),
+    ("originalImageWidth", "OriginalImageWidth", int),
+    ("originalImageHeight", "OriginalImageHeight", int),
+    ("targetImageWidth", "TargetImageWidth", int),
+    ("targetImageHeight", "TargetImageHeight", int),
+    ("cropLeft", "CropLeft", int),
+    ("cropTop", "CropTop", int),
+    ("negativeOriginalImageWidth", "NegativeOriginalImageWidth", int),
+    ("negativeOriginalImageHeight", "NegativeOriginalImageHeight", int),
+    ("stage2Steps", "Stage2Steps", int),
+    ("stage2Guidance", "Stage2Cfg", float),
+    ("stage2Shift", "Stage2Shift", float),
+    ("fps", "FpsId", int),
+    ("motionScale", "MotionBucketId", int),
+    ("guidingFrameNoise", "CondAug", float),
+    ("startFrameGuidance", "StartFrameCfg", float),
+    ("shiftForAudio", "ShiftForAudio", float),
+    ("usesSolAttention", "UsesSolAttention", bool),
+    ("solAttentionStart", "SolAttentionStart", int),
+    ("solAttentionTau", "SolAttentionTau", float),
+    ("causalInference", "CausalInference", int),
+    ("causalInferencePad", "CausalInferencePad", int),
+    ("cfgZeroStar", "CfgZeroStar", bool),
+    ("cfgZeroInitSteps", "CfgZeroInitSteps", int),
+    ("t5TextEncoder", "T5TextEncoder", bool),
+    ("separateT5", "SeparateT5", bool),
+    ("separateClipL", "SeparateClipL", bool),
+    ("separateOpenClipG", "SeparateOpenClipG", bool),
+    ("teaCache", "TeaCache", bool),
+    ("teaCacheStart", "TeaCacheStart", int),
+    ("teaCacheEnd", "TeaCacheEnd", int),
+    ("teaCacheThreshold", "TeaCacheThreshold", float),
+    ("teaCacheMaxSkipSteps", "TeaCacheMaxSkipSteps", int),
+    ("compressionArtifactsQuality", "CompressionArtifactsQuality", float),
+    ("expandPromptToJson", "ExpandPromptToJson", bool),
+)
+
+# Draw Things stores tile sizes in pixels; the FlatBuffer counts 64 px blocks.
+_BLOCK_FIELDS: tuple[tuple[str, str], ...] = (
+    ("decodingTileWidth", "DecodingTileWidth"),
+    ("decodingTileHeight", "DecodingTileHeight"),
+    ("decodingTileOverlap", "DecodingTileOverlap"),
+    ("diffusionTileWidth", "DiffusionTileWidth"),
+    ("diffusionTileHeight", "DiffusionTileHeight"),
+    ("diffusionTileOverlap", "DiffusionTileOverlap"),
+)
+
+_ENUM_FIELDS: tuple[tuple[str, str, dict[str, int]], ...] = (
+    ("sampler", "Sampler", SAMPLERS),
+    ("seedMode", "SeedMode", SEED_MODES),
+    ("colorCalibration", "ColorCalibration", COLOR_CALIBRATIONS),
+    ("compressionArtifacts", "CompressionArtifacts", COMPRESSION_ARTIFACTS),
+)
+
+# Optional strings: absent when empty, never "" (see the note in build_configuration).
+_TEXT_FIELDS: tuple[tuple[str, str], ...] = (
+    ("upscaler", "Upscaler"),
+    ("faceRestoration", "FaceRestoration"),
+    ("refinerModel", "RefinerModel"),
+    ("clipLText", "ClipLText"),
+    ("openClipGText", "OpenClipGText"),
+    ("t5Text", "T5Text"),
+)
+
+
+def _blocks(value: Any) -> int:
+    """Pixels -> 64 px blocks (Draw Things presets store pixels)."""
+    try:
+        return max(0, int(value) // 64)
+    except (TypeError, ValueError):
+        return 0
 
 
 def build_configuration(
@@ -174,16 +404,20 @@ def build_configuration(
 ) -> bytes:
     """Serialize a GenerationConfiguration FlatBuffer.
 
-    Note: start_width / start_height are expressed in 64 px units.
+    Every preset key the bridge understands is written, so a configuration
+    saved in Draw Things replays here. Widths and heights are in 64 px units.
+    Preset keys that are not mapped yet (`controls`, `name`) stay absent; the
+    server then uses its own defaults.
     """
-    b = flatbuffers.Builder(2048)
+    b = flatbuffers.Builder(4096)
     model_off = b.CreateString(model or settings["model"])
     # Optional strings must stay absent (nil) when empty: the server treats an
     # empty upscaler/refiner/face-restoration as "use the default" and would
     # e.g. apply a 4x upscaler to every image.
-    upscaler_off = b.CreateString(settings["upscaler"]) if settings.get("upscaler") else 0
-    face_off = b.CreateString(settings["faceRestoration"]) if settings.get("faceRestoration") else 0
-    refiner_off = b.CreateString(settings["refinerModel"]) if settings.get("refinerModel") else 0
+    text_offsets = {
+        suffix: (b.CreateString(str(settings[key])) if settings.get(key) else 0)
+        for key, suffix in _TEXT_FIELDS
+    }
 
     lora_offsets = []
     for lora in settings.get("loras") or []:
@@ -202,46 +436,78 @@ def build_configuration(
     else:
         loras_vec = 0
 
+    control_offsets = []
+    for control in settings.get("controls") or []:
+        if not isinstance(control, dict) or not control.get("file"):
+            continue
+        blocks = [str(block) for block in control.get("targetBlocks") or []]
+        blocks_vec = 0
+        if blocks:
+            block_offsets = [b.CreateString(block) for block in blocks]
+            b.StartVector(4, len(block_offsets), 4)
+            for off in reversed(block_offsets):
+                b.PrependUOffsetTRelative(off)
+            blocks_vec = b.EndVector()
+        control_file = b.CreateString(str(control["file"]))
+        ControlFB.ControlStart(b)
+        ControlFB.ControlAddFile(b, control_file)
+        ControlFB.ControlAddWeight(b, float(control.get("weight", 1.0)))
+        ControlFB.ControlAddGuidanceStart(b, float(control.get("guidanceStart", 0.0)))
+        ControlFB.ControlAddGuidanceEnd(b, float(control.get("guidanceEnd", 1.0)))
+        ControlFB.ControlAddNoPrompt(b, bool(control.get("noPrompt")))
+        ControlFB.ControlAddGlobalAveragePooling(b, bool(control.get("globalAveragePooling", True)))
+        ControlFB.ControlAddDownSamplingRate(b, float(control.get("downSamplingRate", 1.0)))
+        ControlFB.ControlAddControlMode(
+            b, _enum(control.get("controlImportance", "balanced"), CONTROL_MODES)
+        )
+        ControlFB.ControlAddInputOverride(
+            b, _enum(control.get("inputOverride", ""), CONTROL_INPUT_TYPES)
+        )
+        if blocks_vec:
+            ControlFB.ControlAddTargetBlocks(b, blocks_vec)
+        control_offsets.append(ControlFB.ControlEnd(b))
+
+    if control_offsets:
+        b.StartVector(4, len(control_offsets), 4)
+        for off in reversed(control_offsets):
+            b.PrependUOffsetTRelative(off)
+        controls_vec = b.EndVector()
+    else:
+        controls_vec = 0
+
     GC.GenerationConfigurationStart(b)
     GC.GenerationConfigurationAddId(b, 0)
     GC.GenerationConfigurationAddStartWidth(b, max(1, width // 64))
     GC.GenerationConfigurationAddStartHeight(b, max(1, height // 64))
     GC.GenerationConfigurationAddSeed(b, seed & 0xFFFFFFFF)
-    GC.GenerationConfigurationAddSteps(b, int(settings["steps"]))
-    GC.GenerationConfigurationAddGuidanceScale(b, float(settings["guidanceScale"]))
-    GC.GenerationConfigurationAddStrength(b, float(settings.get("strength", 1.0)))
     GC.GenerationConfigurationAddModel(b, model_off)
-    GC.GenerationConfigurationAddSampler(b, _enum(settings.get("sampler"), SAMPLERS))
     GC.GenerationConfigurationAddBatchCount(b, batch_count)
     GC.GenerationConfigurationAddBatchSize(b, batch_size)
-    GC.GenerationConfigurationAddHiresFix(b, bool(settings.get("hiresFix")))
-    GC.GenerationConfigurationAddHiresFixStartWidth(b, int(settings.get("hiresFixWidth") or 0) // 64)
-    GC.GenerationConfigurationAddHiresFixStartHeight(b, int(settings.get("hiresFixHeight") or 0) // 64)
-    GC.GenerationConfigurationAddHiresFixStrength(b, float(settings.get("hiresFixStrength", 0.7)))
-    if upscaler_off:
-        GC.GenerationConfigurationAddUpscaler(b, upscaler_off)
-    GC.GenerationConfigurationAddSeedMode(b, _enum(settings.get("seedMode"), SEED_MODES))
-    GC.GenerationConfigurationAddClipSkip(b, int(settings.get("clipSkip", 1)))
+    GC.GenerationConfigurationAddHiresFixStartWidth(b, _blocks(settings.get("hiresFixWidth")))
+    GC.GenerationConfigurationAddHiresFixStartHeight(b, _blocks(settings.get("hiresFixHeight")))
+
+    for suffix, offset in text_offsets.items():
+        if offset:
+            getattr(GC, f"GenerationConfigurationAdd{suffix}")(b, offset)
+    for key, suffix, convert in _SCALAR_FIELDS:
+        value = settings.get(key)
+        if value is not None:
+            getattr(GC, f"GenerationConfigurationAdd{suffix}")(b, convert(value))
+    for key, suffix in _BLOCK_FIELDS:
+        value = settings.get(key)
+        if value is not None:
+            getattr(GC, f"GenerationConfigurationAdd{suffix}")(b, _blocks(value))
+    for key, suffix, table in _ENUM_FIELDS:
+        getattr(GC, f"GenerationConfigurationAdd{suffix}")(b, _enum(settings.get(key), table))
+    # Draw Things stores only the frame count for causal inference; 0 means off.
+    GC.GenerationConfigurationAddCausalInferenceEnabled(
+        b, bool(int(settings.get("causalInference") or 0))
+    )
     if loras_vec:
         GC.GenerationConfigurationAddLoras(b, loras_vec)
-    GC.GenerationConfigurationAddMaskBlur(b, float(settings.get("maskBlur", 0)))
-    GC.GenerationConfigurationAddMaskBlurOutset(b, int(settings.get("maskBlurOutset", 0)))
-    if face_off:
-        GC.GenerationConfigurationAddFaceRestoration(b, face_off)
-    if refiner_off:
-        GC.GenerationConfigurationAddRefinerModel(b, refiner_off)
-    GC.GenerationConfigurationAddRefinerStart(b, float(settings.get("refinerStart", 0.7)))
-    GC.GenerationConfigurationAddNumFrames(b, int(settings.get("numFrames", 1)))
-    GC.GenerationConfigurationAddSharpness(b, float(settings.get("sharpness", 0)))
-    GC.GenerationConfigurationAddShift(b, float(settings.get("shift", 1.0)))
-    GC.GenerationConfigurationAddPreserveOriginalAfterInpaint(
-        b, bool(settings.get("preserveOriginalAfterInpaint", True))
-    )
-    GC.GenerationConfigurationAddTiledDecoding(b, bool(settings.get("tiledDecoding")))
-    GC.GenerationConfigurationAddTiledDiffusion(b, bool(settings.get("tiledDiffusion")))
-    GC.GenerationConfigurationAddColorCalibration(
-        b, _enum(settings.get("colorCalibration", "none"), COLOR_CALIBRATIONS)
-    )
+    if controls_vec:
+        GC.GenerationConfigurationAddControls(b, controls_vec)
+
     root = GC.GenerationConfigurationEnd(b)
     b.Finish(root)
     return bytes(b.Output())
@@ -281,6 +547,24 @@ def decode_tensor_png(data: bytes) -> bytes:
     buffer = io.BytesIO()
     Image.fromarray(rgb, "RGB").save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def encode_image_tensor(image: bytes, width: int, height: int) -> bytes:
+    """Convert PNG/JPEG bytes into a Draw Things NNC input tensor frame.
+
+    The server never accepts PNG/JPEG for `image` (nor for `mask` or control
+    hints): it wants [uint32 identifier=0][ccv_nnc_tensor_param_t 64B][fp16
+    NHWC] with pixels normalised to [-1, 1]. The source is resized to the
+    generation size first, which is what the app does for img2img.
+    """
+    with Image.open(io.BytesIO(image)) as source:
+        rgb = source.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+    pixels = np.asarray(rgb, dtype=np.float32) * (2.0 / 255.0) - 1.0
+    dims = [1, height, width, 3, 0, 0, 0, 0, 0, 0, 0, 0]
+    header = struct.pack("<I", 0) + struct.pack(
+        "<16i", CCV_TENSOR_CPU_MEMORY, CCV_TENSOR_FORMAT_NHWC, CCV_16F, 0, *dims
+    )
+    return header + pixels.astype("<f2").tobytes()
 
 
 class Backend:
@@ -335,11 +619,43 @@ class Backend:
         return dict(zip(reply.files, reply.existences, strict=False))
 
     async def generate(
-        self, *, prompt: str, negative_prompt: str, configuration: bytes
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str,
+        configuration: bytes,
+        image: bytes | None = None,
+        hints: list[tuple[str, bytes]] | None = None,
     ) -> list[bytes]:
         assert self.channel is not None
         images: list[bytes] = []
         buffer = bytearray()
+        fields: dict[str, Any] = {
+            "prompt": prompt,
+            "negativePrompt": negative_prompt,
+            "configuration": configuration,
+            "user": "openai-bridge",
+            "chunked": True,
+        }
+        # Large payloads are addressed by sha256 and shipped in `contents`.
+        contents: list[bytes] = []
+        if image is not None:
+            fields["image"] = hashlib.sha256(image).digest()
+            fields["scaleFactor"] = 1
+            contents.append(image)
+        if hints:
+            hint_protos = []
+            for hint_type, frame in hints:
+                contents.append(frame)
+                hint_protos.append(
+                    pb.HintProto(
+                        hintType=hint_type,
+                        tensors=[pb.TensorAndWeight(tensor=hashlib.sha256(frame).digest(), weight=1.0)],
+                    )
+                )
+            fields["hints"] = hint_protos
+        if contents:
+            fields["contents"] = contents
         async with self.channel.request(
             "/ImageGenerationService/GenerateImage",
             Cardinality.UNARY_STREAM,
@@ -347,16 +663,7 @@ class Backend:
             pb.ImageGenerationResponse,
             timeout=DT_TIMEOUT,
         ) as stream:
-            await stream.send_message(
-                pb.ImageGenerationRequest(
-                    prompt=prompt,
-                    negativePrompt=negative_prompt,
-                    configuration=configuration,
-                    user="openai-bridge",
-                    chunked=True,
-                ),
-                end=True,
-            )
+            await stream.send_message(pb.ImageGenerationRequest(**fields), end=True)
             async for response in stream:
                 for chunk in response.generatedImages:
                     buffer.extend(chunk)
@@ -404,6 +711,21 @@ def check_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+def _hint_type(value: Any) -> str:
+    """Validate a ControlNet hint type ("custom" when the client omits it)."""
+    name = str(value or "custom").strip().lower()
+    if name == "scribble":
+        raise HTTPException(
+            status_code=501, detail="scribble hints need a 1-byte mask tensor - not wired yet"
+        )
+    if name not in HINT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown control type {name!r}; use one of {', '.join(HINT_TYPES)}",
+        )
+    return name
+
+
 async def render_pngs(
     *,
     prompt: str,
@@ -414,14 +736,42 @@ async def render_pngs(
     count: int,
     settings: dict[str, Any],
     model: str | None = None,
+    source_image: bytes | None = None,
+    strength: float | None = None,
+    hint_images: list[tuple[str, bytes]] | None = None,
 ) -> list[bytes]:
-    """Run one generation and return PNG bytes (one per image)."""
+    """Run one generation and return PNG bytes (one per image).
+
+    `source_image` (PNG/JPEG bytes) turns this into an img2img request: the
+    canvas travels as an NNC tensor and the config describes it as the original
+    image, exactly as the app does.
+    """
     chosen_model = model or settings.get("model") or ""
     if not chosen_model:
         raise HTTPException(
             status_code=400,
             detail="No model configured. Load a preset in './dt tui' (press l) or set 'model' in config.json.",
         )
+    if source_image is not None:
+        settings = {
+            **settings,
+            "originalImageWidth": width,
+            "originalImageHeight": height,
+            "targetImageWidth": width,
+            "targetImageHeight": height,
+            "cropLeft": 0,
+            "cropTop": 0,
+        }
+    if strength is not None:
+        settings = {**settings, "strength": float(strength)}
+    tensor = encode_image_tensor(source_image, width, height) if source_image is not None else None
+    # ControlNet input images travel as hints, keyed by the hint type the
+    # ControlNet expects ("pose", "depth", "canny", ...).
+    hints = (
+        [(hint_type, encode_image_tensor(data, width, height)) for hint_type, data in hint_images]
+        if hint_images
+        else None
+    )
     configuration = build_configuration(
         settings=settings,
         width=width,
@@ -440,6 +790,8 @@ async def render_pngs(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 configuration=configuration,
+                image=tensor,
+                hints=hints,
             )
         except Exception as exc:  # translated into an HTTP error
             raise HTTPException(status_code=502, detail=f"Draw Things error: {exc}") from exc
@@ -483,8 +835,8 @@ def parse_size(payload: ImageGenerationRequest) -> tuple[int, int]:
         except (ValueError, AttributeError):
             pass
     # start_width/start_height are in 64 px units, so snap to the grid.
-    width = max(64, (width // 64) * 64)
-    height = max(64, (height // 64) * 64)
+    width = max(64, min((width // 64) * 64, MAX_IMAGE_SIZE))
+    height = max(64, min((height // 64) * 64, MAX_IMAGE_SIZE))
     return width, height
 
 
@@ -551,7 +903,29 @@ async def healthz():
         "model": model,
         "models_ready": not missing,
         "missing": missing,
+        # ControlNet entries loaded from the preset; a request must also carry a
+        # control image ("control_image" / a ControlNetApply LoadImage) to use them.
+        "controls": [
+            str(control["file"])
+            for control in SETTINGS.get("controls") or []
+            if isinstance(control, dict) and control.get("file")
+        ],
+        # Preset features that are loaded but not sent to the server yet.
+        "unsupported": sorted(key for key in UNSUPPORTED_SETTINGS if SETTINGS.get(key)),
     }
+
+
+def _images_payload(pngs: list[bytes], response_format: str, request: Request) -> dict[str, Any]:
+    """OpenAI response envelope: b64_json payloads or URLs served by /images."""
+    data: list[dict[str, str]] = []
+    for png in pngs:
+        if response_format == "url":
+            name = f"{uuid.uuid4().hex}.png"
+            (IMAGE_DIR / name).write_bytes(png)
+            data.append({"url": str(request.base_url).rstrip("/") + f"/images/{name}"})
+        else:
+            data.append({"b64_json": base64.b64encode(png).decode("ascii")})
+    return {"created": int(time.time()), "data": data}
 
 
 @app.post("/v1/images/generations")
@@ -582,17 +956,94 @@ async def create_image(payload: ImageGenerationRequest, request: Request):
         settings=settings,
         model=pick_model(payload.model),
     )
+    return _images_payload(pngs, payload.response_format or "b64_json", request)
 
-    created = int(time.time())
-    data: list[dict[str, str]] = []
-    for png in pngs:
-        if (payload.response_format or "b64_json") == "url":
-            name = f"{uuid.uuid4().hex}.png"
-            (IMAGE_DIR / name).write_bytes(png)
-            data.append({"url": str(request.base_url).rstrip("/") + f"/images/{name}"})
-        else:
-            data.append({"b64_json": base64.b64encode(png).decode("ascii")})
-    return {"created": created, "data": data}
+
+@app.post("/v1/images/edits")
+async def create_image_edit(request: Request):
+    """OpenAI-compatible img2img: multipart `image` + `prompt`.
+
+    `strength` (0-1) is a bridge extension and maps to the Draw Things strength;
+    without it the configured value is used. Masks (inpainting) are not wired.
+    """
+    check_auth(request)
+    form = await request.form()
+    upload = form.get("image")
+    if not isinstance(upload, UploadFile):
+        raise HTTPException(status_code=400, detail="expected a multipart 'image' file field")
+    source = await upload.read()
+    if not source:
+        raise HTTPException(status_code=400, detail="uploaded image is empty")
+    if len(source) > UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413, detail=f"image is larger than {UPLOAD_MAX_BYTES // (1024 * 1024)} MB"
+        )
+    prompt = str(form.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="'prompt' is required")
+    if form.get("mask"):
+        raise HTTPException(status_code=501, detail="inpainting masks are not supported yet")
+
+    settings = dict(SETTINGS)
+    with Image.open(io.BytesIO(source)) as probe:
+        source_width, source_height = probe.size
+    width, height = source_width, source_height
+    size = form.get("size")
+    if isinstance(size, str) and "x" in size.lower():
+        try:
+            width = int(size.lower().split("x")[0])
+            height = int(size.lower().split("x")[1])
+        except (ValueError, IndexError):
+            width, height = source_width, source_height
+    width = max(64, min((width // 64) * 64, MAX_IMAGE_SIZE))
+    height = max(64, min((height // 64) * 64, MAX_IMAGE_SIZE))
+
+    strength = None
+    raw_strength = form.get("strength")
+    if isinstance(raw_strength, str) and raw_strength.strip():
+        try:
+            strength = max(0.0, min(float(raw_strength), 1.0))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="'strength' must be a number 0-1") from exc
+
+    count = 1
+    raw_n = form.get("n")
+    if isinstance(raw_n, str) and raw_n.strip().isdigit():
+        count = max(1, min(int(raw_n), 4))
+
+    hint_images: list[tuple[str, bytes]] = []
+    control = form.get("control_image")
+    if isinstance(control, UploadFile):
+        control_type = _hint_type(form.get("control_type"))
+        control_bytes = await control.read()
+        if control_bytes:
+            hint_images.append((control_type, control_bytes))
+
+    seed = int(settings.get("seed", -1))
+    raw_seed = form.get("seed")
+    if isinstance(raw_seed, str) and raw_seed.strip():
+        try:
+            seed = int(raw_seed)
+        except ValueError:
+            seed = -1
+    if seed < 0:
+        seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+
+    pngs = await render_pngs(
+        prompt=prompt,
+        negative_prompt=str(form.get("negative_prompt") or ""),
+        width=width,
+        height=height,
+        seed=seed,
+        count=count,
+        settings=settings,
+        model=pick_model(str(form.get("model") or "")),
+        source_image=source,
+        strength=strength,
+        hint_images=hint_images or None,
+    )
+    response_format = form.get("response_format")
+    return _images_payload(pngs, response_format if isinstance(response_format, str) else "b64_json", request)
 
 
 @app.get("/images/{name}")
@@ -603,17 +1054,68 @@ async def get_image(name: str):
     return FileResponse(path, media_type="image/png")
 
 
+def _uploaded_name(filename: str | None, data: bytes) -> str:
+    """Flat, predictable name for an uploaded source image."""
+    base = os.path.basename((filename or "").replace("\\", "/")).strip()
+    stem, suffix = os.path.splitext(base)
+    if suffix.lower() not in IMAGE_SUFFIXES:
+        suffix = ".png"
+    return f"{stem or 'upload-' + uuid.uuid4().hex}{suffix}"
+
+
+@app.post("/upload/image")
+async def upload_image(request: Request):
+    """ComfyUI's /upload/image: park a source image and return its name.
+
+    ComfyUI clients (SillyTavern's img2img workflows, RisuAI) POST the picture
+    here, then reference the returned name from a LoadImage node.
+    """
+    check_auth(request)
+    form = await request.form()
+    upload = form.get("image")
+    if not isinstance(upload, UploadFile):
+        raise HTTPException(status_code=400, detail="expected a multipart 'image' file field")
+    data = await upload.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="uploaded image is empty")
+    if len(data) > UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413, detail=f"image is larger than {UPLOAD_MAX_BYTES // (1024 * 1024)} MB"
+        )
+    try:
+        with Image.open(io.BytesIO(data)) as probe:
+            probe.verify()
+    except Exception as exc:  # noqa: BLE001 - reported to the client
+        raise HTTPException(status_code=400, detail=f"not a readable image: {exc}") from exc
+    name = _uploaded_name(upload.filename, data)
+    (INPUT_DIR / name).write_bytes(data)
+    return {"name": name, "subfolder": "", "type": "input"}
+
+
+def _uploaded_images(limit: int = 200) -> list[str]:
+    """Source images a LoadImage node can pick from (newest first)."""
+    try:
+        entries = [path for path in INPUT_DIR.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES]
+    except OSError:
+        return []
+    entries.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return [path.name for path in entries[:limit]]
+
+
 # ---------------------------------------------------------------------------
 # ComfyUI-compatible surface (subset)
 #
 # Clients such as SillyTavern and RisuAI talk to ComfyUI by POSTing a workflow
-# graph and then polling /history + fetching /view. We only interpret the nodes
-# that describe *what* to draw (prompt, negative, size, seed, filename); steps,
-# cfg, sampler, checkpoint and LoRAs stay under our control via config.json.
+# graph and then polling /history + fetching /view. We interpret the prompt,
+# negative, size, seed, batch, filename and - for img2img - a LoadImage node plus
+# the sampler's denoise (which becomes the Draw Things strength); steps, cfg,
+# sampler, checkpoint and LoRAs stay under our control via config.json.
 # ---------------------------------------------------------------------------
 
 SAMPLER_NODES = {"KSampler", "KSamplerAdvanced", "SamplerCustom"}
 LATENT_NODES = {"EmptyLatentImage", "EmptySD3LatentImage", "EmptySDXLLatentImage"}
+LOAD_NODES = {"LoadImage"}
+CONTROL_NODES = {"ControlNetApply", "ControlNetApplyAdvanced", "ControlNetApplySD3"}
 SAVE_NODES = {"SaveImage", "PreviewImage"}
 TEXT_NODES = {"CLIPTextEncode", "CLIPTextEncodeSDXL", "BNK_CLIPTextEncodeAdvanced"}
 LITERAL_INPUTS = ("value", "string", "text", "int", "float", "number", "seed")
@@ -679,15 +1181,43 @@ def _walk_up(graph: dict[str, Any], node_id: str, classes: set[str]) -> tuple[st
     return None
 
 
-def _conditioning_text(graph: dict[str, Any], value: Any) -> str:
+def _images_under(graph: dict[str, Any], node_id: str) -> list[str]:
+    """LoadImage file names reachable upstream from one node link."""
+    names: list[str] = []
+    seen: set[str] = set()
+    stack = [str(node_id)]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        node = _node(graph, current)
+        if node.get("class_type") in LOAD_NODES:
+            name = _literal(graph, (node.get("inputs") or {}).get("image"))
+            if isinstance(name, str) and name.strip() and name.strip() not in names:
+                names.append(name.strip())
+        for value in (node.get("inputs") or {}).values():
+            link = _link(value)
+            if link is not None:
+                stack.append(link[0])
+    return names
+
+
+def _conditioning_text(graph: dict[str, Any], value: Any, key: str | None = None) -> str:
     link = _link(value)
     if link is None:
         return ""
+    # ControlNetApply* nodes sit between the sampler and the text encoders; follow
+    # their own positive/negative input instead of guessing among all inputs.
+    node = _node(graph, link[0])
+    if key is not None and node.get("class_type") in CONTROL_NODES:
+        inner = (node.get("inputs") or {}).get(key)
+        return _conditioning_text(graph, inner, key)
     found = _walk_up(graph, link[0], TEXT_NODES)
     if found is None:
         return ""
-    _, node = found
-    text = _literal(graph, (node.get("inputs") or {}).get("text"))
+    _, text_node = found
+    text = _literal(graph, (text_node.get("inputs") or {}).get("text"))
     return text if isinstance(text, str) else ""
 
 
@@ -718,8 +1248,8 @@ def parse_comfy_graph(graph: dict[str, Any]) -> dict[str, Any]:
         raise ComfyGraphError("no KSampler node found in workflow")
 
     inputs = sampler.get("inputs") or {}
-    prompt = _conditioning_text(graph, inputs.get("positive"))
-    negative = _conditioning_text(graph, inputs.get("negative"))
+    prompt = _conditioning_text(graph, inputs.get("positive"), "positive")
+    negative = _conditioning_text(graph, inputs.get("negative"), "negative")
     if not prompt:
         # Some custom nodes put the text straight on the sampler.
         fallback = _literal(graph, inputs.get("text") or inputs.get("prompt"))
@@ -747,21 +1277,56 @@ def parse_comfy_graph(graph: dict[str, Any]) -> dict[str, Any]:
     if save_node is not None:
         prefix = _literal(graph, (save_node.get("inputs") or {}).get("filename_prefix"))
 
+    # img2img: a LoadImage node names a file uploaded through /upload/image, and
+    # the sampler's denoise becomes the Draw Things strength. LoadImage nodes
+    # wired into a ControlNetApply node are control hints, not the canvas.
+    hint_names: list[str] = []
+    for node in graph.values():
+        if isinstance(node, dict) and node.get("class_type") in CONTROL_NODES:
+            for value in (node.get("inputs") or {}).values():
+                link = _link(value)
+                if link is None:
+                    continue
+                for name in _images_under(graph, link[0]):
+                    if name not in hint_names:
+                        hint_names.append(name)
+
+    canvas_names = _images_under(graph, latent_link[0]) if latent_link is not None else []
+    source = canvas_names[0] if canvas_names else None
+    if source is None:
+        for node in graph.values():
+            if isinstance(node, dict) and node.get("class_type") in LOAD_NODES:
+                candidate = _literal(graph, (node.get("inputs") or {}).get("image"))
+                if isinstance(candidate, str) and candidate.strip():
+                    source = candidate.strip()
+                    break
+    hints = [name for name in hint_names if name != source]
+
     def _int(value: Any, default: int) -> int:
         try:
             return int(value)
         except (TypeError, ValueError):
             return default
 
+    def _float(value: Any) -> float | None:
+        try:
+            return max(0.0, min(float(value), 1.0))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
     return {
         "prompt": prompt,
         "negative": negative,
         "width": _int(width, int(SETTINGS["width"])),
         "height": _int(height, int(SETTINGS["height"])),
+        "size_from_latent": width is not None and height is not None,
         "batch": max(1, min(_int(batch, 1), 4)),
         "seed": _int(seed, -1),
         "save_node": save_id or "0",
         "prefix": str(prefix) if prefix else "DrawThings",
+        "source": source,
+        "hints": hints,
+        "strength": _float(_literal(graph, inputs.get("denoise"))) if source else None,
     }
 
 
@@ -780,8 +1345,28 @@ async def _run_comfy_job(prompt_id: str, spec: dict[str, Any]) -> None:
     await _comfy_broadcast({"type": "executing", "data": {"node": spec["save_node"], "prompt_id": prompt_id}})
     try:
         seed = spec["seed"] if spec["seed"] >= 0 else int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
-        width = max(64, (spec["width"] // 64) * 64)
-        height = max(64, (spec["height"] // 64) * 64)
+        width = max(64, min((spec["width"] // 64) * 64, MAX_IMAGE_SIZE))
+        height = max(64, min((spec["height"] // 64) * 64, MAX_IMAGE_SIZE))
+        source_image = None
+        if spec.get("source"):
+            source_path = INPUT_DIR / os.path.basename(str(spec["source"]))
+            if not source_path.is_file():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"source image {spec['source']!r} was not uploaded; POST it to /upload/image first",
+                )
+            source_image = source_path.read_bytes()
+            if not spec.get("size_from_latent"):
+                # img2img workflows that never size a latent keep the source size.
+                with Image.open(io.BytesIO(source_image)) as probe:
+                    source_width, source_height = probe.size
+                width = max(64, min((source_width // 64) * 64, MAX_IMAGE_SIZE))
+                height = max(64, min((source_height // 64) * 64, MAX_IMAGE_SIZE))
+        hint_images: list[tuple[str, bytes]] = []
+        for hint_name in spec.get("hints") or []:
+            hint_path = INPUT_DIR / os.path.basename(str(hint_name))
+            if hint_path.is_file():
+                hint_images.append(("custom", hint_path.read_bytes()))
         pngs = await render_pngs(
             prompt=spec["prompt"],
             negative_prompt=spec["negative"],
@@ -790,6 +1375,9 @@ async def _run_comfy_job(prompt_id: str, spec: dict[str, Any]) -> None:
             seed=seed,
             count=spec["batch"],
             settings=SETTINGS,
+            source_image=source_image,
+            strength=spec.get("strength"),
+            hint_images=hint_images or None,
         )
         filenames = []
         for png in pngs:
@@ -887,10 +1475,12 @@ async def comfy_history_all(max_items: int = 100):
 async def comfy_view(filename: str, subfolder: str = "", type: str = "output"):  # noqa: A002
     # subfolder/type are part of the ComfyUI contract but everything is flat here.
     _ = (subfolder, type)
-    path = IMAGE_DIR / os.path.basename(filename)
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Not found")
-    return FileResponse(path, media_type="image/png")
+    name = os.path.basename(filename)
+    for directory in (IMAGE_DIR, INPUT_DIR):
+        path = directory / name
+        if path.is_file():
+            return FileResponse(path, media_type="image/png")
+    raise HTTPException(status_code=404, detail="Not found")
 
 
 @app.get("/object_info")
@@ -946,6 +1536,14 @@ async def comfy_object_info():
             "output_name": ["LATENT"],
             "name": "KSampler",
             "category": "sampling",
+            "output_node": False,
+        },
+        "LoadImage": {
+            "input": {"required": {"image": [_uploaded_images()]}},
+            "output": ["IMAGE", "MASK"],
+            "output_name": ["IMAGE", "MASK"],
+            "name": "LoadImage",
+            "category": "image",
             "output_node": False,
         },
         "VAEDecode": {
